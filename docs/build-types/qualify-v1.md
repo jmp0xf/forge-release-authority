@@ -2,7 +2,7 @@
 
 Identity: `https://github.com/jmp0xf/forge-release-authority/blob/main/docs/build-types/qualify-v1.md`
 
-Status: contract frozen for bootstrap; the executable workflow is not yet installed.
+Status: contract frozen for bootstrap; the executable workflow is installed for an inactive, non-release canary.
 
 This document defines the `buildType` used by the Forge release authority's deterministic
 [SLSA Provenance v1](https://slsa.dev/spec/v1.2/build-provenance) predicate. It defines how one exact Forge source
@@ -11,7 +11,7 @@ claim a SLSA Build level.
 
 ## Invocation
 
-Once installed, `.github/workflows/qualify.yml` is initiated manually with one external input:
+`.github/workflows/qualify.yml` is initiated manually with one external input:
 
 ```json
 {"sourceCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
@@ -111,19 +111,24 @@ The build type consists of these fail-closed stages:
 3. An unprivileged finalize job runs the candidate's local finalization and checks, copies the source-bound
    `THIRD-PARTY-LICENSES.txt`, and assembles exactly thirteen final files. It has no OIDC token, protected environment,
    or publication permission.
-4. The protected job checks out only the authority repository. Its standard-library-only verifier uses the GitHub Git
+4. An independent unprivileged job checks out only the authority repository and runs the same verifier over fresh
+   copies of the finalized bytes. Its deterministic outputs are a preview, not signing authority, and are not trusted
+   by the protected job.
+5. The protected job checks out only the authority repository. Its standard-library-only verifier uses the GitHub Git
    Data API at fixed numeric repository identities to resolve each exact commit, tree, and regular blob. It rejects
    redirects, mutable refs, symlinks, submodules, executable source-material modes, identity drift, truncation, digest
    mismatch, or resource-limit violations. It fetches `Cargo.lock` and `THIRD-PARTY-LICENSES.txt` itself, and verifies
    that the running policy and verifier bytes match the protected authority commit. It does not import Forge code, run
    Cargo or xtask, or execute candidate binaries. It then independently verifies the exact file sets, manifest,
    checksums, SBOM graph and licenses, native executable structures, and builder records.
-5. The verifier emits a deterministic predicate plus checksums for all thirteen subjects. A pinned attestation action
+6. The verifier emits a deterministic predicate plus checksums for all thirteen subjects. A pinned attestation action
    may wrap them in an in-toto Statement only after protected-environment approval. Publication is a later,
    create-only operation and is not part of this build type.
 
 Any missing capability, unknown field, unexpected file, identity drift, checksum mismatch, structure mismatch,
 resource-limit violation, output collision, or partial write fails the invocation. A failed run is never approval.
+Because workflow artifact uploads are create-only, any failed, rejected, or incomplete workflow attempt requires a
+fresh `workflow_dispatch`. GitHub's re-run controls do not create a new reviewed invocation and must not be used.
 
 ## Subjects
 

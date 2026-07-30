@@ -18,8 +18,10 @@ qualification, attestation, approval, publication, or withdrawal rules that judg
 
 ## Status
 
-The repository is being bootstrapped. It does not yet qualify, attest, tag, upload, or publish Forge releases. The
-first executable workflow will be added in a separate reviewed pull request.
+The repository is being bootstrapped. The permission-separated `.github/workflows/qualify.yml` is installed for an
+inactive canary, but it must not be treated as release qualification. Before activation, hosted controls must be
+verified and a non-release canary must record and freeze the actual runner inputs and signer-builder identity in a
+follow-up reviewed change. The repository does not yet tag, upload, or publish Forge releases.
 
 The stable provenance identities are documented by the
 [Forge qualification build type](docs/build-types/qualify-v1.md) and the
@@ -30,7 +32,9 @@ level until the complete platform and signer-builder pair have been independentl
 The verifier creates its predicate and subject-checksum outputs without overwriting existing paths. The two files are
 not a multi-file transaction: a late write failure can leave one sibling behind. Qualification runs therefore require
 an initially empty output directory owned by the verifier user with mode `0700`, and no concurrent process running as
-that same user may modify it. Inspect any residue after failure and rerun from a new empty private directory.
+that same user may modify it. For a direct verifier invocation, inspect any residue after failure and rerun from a new
+empty private directory. A failed, rejected, or incomplete GitHub workflow attempt instead requires a fresh
+`workflow_dispatch`; do not use GitHub's job or run re-run controls.
 
 The production verifier accepts only finalized asset and builder-record directories plus the requested Forge commit.
 It derives the authority commit from an exact protected-main GitHub Actions context, reads policy from its own checkout,
