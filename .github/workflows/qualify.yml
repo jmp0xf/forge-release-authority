@@ -1,0 +1,758 @@
+name: qualify
+
+run-name: Qualify Forge ${{ inputs.sourceCommit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sourceCommit:
+        description: Exact protected Forge main commit
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_AUTO_INSTALL: "0"
+  RUSTUP_TOOLCHAIN: 1.96.0
+
+concurrency:
+  group: forge-v0.1.0-rc.2-qualification
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Bind protected source and authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: authority
+          persist-credentials: false
+          show-progress: false
+      - name: Install Python 3.14.6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.6"
+          check-latest: false
+      - name: Resolve protected commits and source materials
+        working-directory: authority
+        env:
+          FORGE_AUTHORITY_GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.sourceCommit }}
+        run: |
+          python - <<'PY'
+          import os
+
+          from scripts import verify_release as verifier
+
+          policy, _ = verifier.load_policy(verifier.AUTHORITY_POLICY_PATH)
+          authority_commit = verifier._authority_commit_from_actions_environment(os.environ)
+          materials = verifier._resolve_github_materials(
+              policy,
+              os.environ["SOURCE_COMMIT"],
+              authority_commit,
+          )
+          if materials.authority_policy != verifier.AUTHORITY_POLICY_PATH.read_bytes():
+              raise SystemExit("protected authority policy differs from this checkout")
+          if materials.authority_verifier != verifier.AUTHORITY_VERIFIER_PATH.read_bytes():
+              raise SystemExit("protected authority verifier differs from this checkout")
+          PY
+
+  native-build:
+    name: Native build / ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: forge-0.1.0-rc.2-x86_64-unknown-linux-musl
+            sbom: forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json
+            record: builder-record-x86_64-unknown-linux-musl.json
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary: forge-0.1.0-rc.2-aarch64-unknown-linux-musl
+            sbom: forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json
+            record: builder-record-aarch64-unknown-linux-musl.json
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: forge-0.1.0-rc.2-x86_64-apple-darwin
+            sbom: forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json
+            record: builder-record-x86_64-apple-darwin.json
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: forge-0.1.0-rc.2-aarch64-apple-darwin
+            sbom: forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json
+            record: builder-record-aarch64-apple-darwin.json
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe
+            sbom: forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json
+            record: builder-record-x86_64-pc-windows-msvc.json
+    env:
+      AUTHORITY_COMMIT: ${{ github.sha }}
+      BINARY: ${{ matrix.binary }}
+      CARGO_HOME: ${{ github.workspace }}/native-cargo-home
+      HANDOFF_DIR: ${{ github.workspace }}/native-handoff
+      RECORD: ${{ matrix.record }}
+      SBOM: ${{ matrix.sbom }}
+      SOURCE_COMMIT: ${{ inputs.sourceCommit }}
+      STAGE_DIR: ${{ github.workspace }}/native-stage
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: authority
+          persist-credentials: false
+          show-progress: false
+      - name: Check out exact Forge source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jmp0xf/forge
+          ref: ${{ inputs.sourceCommit }}
+          path: forge
+          persist-credentials: false
+          show-progress: false
+          lfs: false
+          submodules: false
+      - name: Install Python 3.14.6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.6"
+          check-latest: false
+      - name: Create fresh native directories
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in "$CARGO_HOME" "$STAGE_DIR" "$HANDOFF_DIR"; do
+            if [[ -e "$directory" ]]; then
+              echo "refusing existing native directory: $directory" >&2
+              exit 1
+            fi
+            mkdir -m 0700 "$directory"
+          done
+      - name: Create fresh native directories on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($directory in @($env:CARGO_HOME, $env:STAGE_DIR, $env:HANDOFF_DIR)) {
+            if (Test-Path -LiteralPath $directory) {
+              throw "refusing existing native directory: $directory"
+            }
+            New-Item -ItemType Directory -Path $directory | Out-Null
+          }
+      - name: Install exact Rust toolchain
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
+          rustup default "$RUSTUP_TOOLCHAIN"
+          [[ "$(rustc --version | awk '{print $2}')" == "$RUSTUP_TOOLCHAIN" ]]
+          rustc --version --verbose
+      - name: Install exact Rust toolchain on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component clippy --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $env:RUSTUP_TOOLCHAIN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = rustc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $version.StartsWith("rustc $env:RUSTUP_TOOLCHAIN ")) {
+            throw "unexpected rustc version: $version"
+          }
+          rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install native musl toolchain
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          case "$TARGET" in
+            x86_64-unknown-linux-musl)
+              echo "CC_x86_64_unknown_linux_musl=musl-gcc" >>"$GITHUB_ENV"
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >>"$GITHUB_ENV"
+              ;;
+            aarch64-unknown-linux-musl)
+              echo "CC_aarch64_unknown_linux_musl=musl-gcc" >>"$GITHUB_ENV"
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >>"$GITHUB_ENV"
+              ;;
+            *)
+              echo "unexpected Linux target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+      - name: Check, test, and stage native assets
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: forge
+        run: |
+          set -euo pipefail
+          [[ -z "$(git status --porcelain=v2 --untracked-files=all --ignore-submodules=none)" ]]
+          cargo fetch --locked
+          cargo check --locked --offline --workspace --all-targets --target "$TARGET"
+          cargo clippy --locked --offline --workspace --all-targets --target "$TARGET" -- -D warnings
+          cargo test --locked --offline --workspace --target "$TARGET" --no-fail-fast
+          cargo build --locked --offline -p xtask
+          target/debug/xtask release-build --target "$TARGET" --output-dir "$STAGE_DIR"
+          chmod +x "$STAGE_DIR/$BINARY"
+          "$STAGE_DIR/$BINARY" version
+          python "$GITHUB_WORKSPACE/authority/scripts/write_builder_record.py" \
+            --policy "$GITHUB_WORKSPACE/authority/contracts/release-policy.json" \
+            --assets "$STAGE_DIR" \
+            --output-dir "$HANDOFF_DIR" \
+            --target "$TARGET" \
+            --source-commit "$SOURCE_COMMIT" \
+            --authority-commit "$AUTHORITY_COMMIT"
+          cp -- "$STAGE_DIR/$BINARY" "$HANDOFF_DIR/$BINARY"
+          cp -- "$STAGE_DIR/$SBOM" "$HANDOFF_DIR/$SBOM"
+          python - <<'PY'
+          import os
+          import stat
+          from pathlib import Path
+
+          directory = Path(os.environ["HANDOFF_DIR"])
+          expected = {
+              os.environ["BINARY"],
+              os.environ["SBOM"],
+              os.environ["RECORD"],
+          }
+          entries = {entry.name: entry for entry in directory.iterdir()}
+          if set(entries) != expected:
+              raise SystemExit(f"native handoff mismatch: {sorted(entries)}")
+          if any(not stat.S_ISREG(entry.lstat().st_mode) for entry in entries.values()):
+              raise SystemExit("native handoff contains a non-regular file")
+          PY
+      - name: Check, test, and stage native assets on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: forge
+        run: |
+          $ErrorActionPreference = "Stop"
+          $status = git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($status) { throw "Forge checkout is not clean" }
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --offline --workspace --all-targets --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --offline --workspace --all-targets --target $env:TARGET -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --offline --workspace --target $env:TARGET --no-fail-fast
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --offline -p xtask
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\target\debug\xtask.exe release-build --target $env:TARGET --output-dir $env:STAGE_DIR
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $env:STAGE_DIR $env:BINARY) version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python "$env:GITHUB_WORKSPACE\authority\scripts\write_builder_record.py" `
+            --policy "$env:GITHUB_WORKSPACE\authority\contracts\release-policy.json" `
+            --assets $env:STAGE_DIR `
+            --output-dir $env:HANDOFF_DIR `
+            --target $env:TARGET `
+            --source-commit $env:SOURCE_COMMIT `
+            --authority-commit $env:AUTHORITY_COMMIT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath (Join-Path $env:STAGE_DIR $env:BINARY) -Destination $env:HANDOFF_DIR
+          Copy-Item -LiteralPath (Join-Path $env:STAGE_DIR $env:SBOM) -Destination $env:HANDOFF_DIR
+          $expected = @($env:BINARY, $env:SBOM, $env:RECORD) | Sort-Object
+          $entries = @(Get-ChildItem -LiteralPath $env:HANDOFF_DIR)
+          if ($entries.Where({ -not $_.PSIsContainer }).Count -ne 3 -or $entries.Where({ $_.PSIsContainer }).Count -ne 0) {
+            throw "native handoff does not contain exactly three regular files"
+          }
+          $actual = $entries.Name | Sort-Object
+          if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
+            throw "native handoff names do not match the fixed contract"
+          }
+      - name: Upload fixed native handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-${{ matrix.target }}
+          path: |
+            ${{ env.HANDOFF_DIR }}/${{ matrix.binary }}
+            ${{ env.HANDOFF_DIR }}/${{ matrix.sbom }}
+            ${{ env.HANDOFF_DIR }}/${{ matrix.record }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  finalize:
+    name: Finalize candidate assets
+    needs: native-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_HOME: ${{ github.workspace }}/finalize-cargo-home
+      DIST_DIR: ${{ github.workspace }}/forge-finalize/dist
+      RECORDS_DIR: ${{ github.workspace }}/forge-finalize/records
+      SOURCE_COMMIT: ${{ inputs.sourceCommit }}
+    steps:
+      - name: Check out exact Forge source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jmp0xf/forge
+          ref: ${{ inputs.sourceCommit }}
+          path: forge
+          persist-credentials: false
+          show-progress: false
+          lfs: false
+          submodules: false
+      - name: Download x86_64 Linux handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/forge-native/x86_64-unknown-linux-musl
+      - name: Download aarch64 Linux handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-aarch64-unknown-linux-musl
+          path: ${{ runner.temp }}/forge-native/aarch64-unknown-linux-musl
+      - name: Download x86_64 macOS handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-x86_64-apple-darwin
+          path: ${{ runner.temp }}/forge-native/x86_64-apple-darwin
+      - name: Download aarch64 macOS handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-aarch64-apple-darwin
+          path: ${{ runner.temp }}/forge-native/aarch64-apple-darwin
+      - name: Download Windows handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/forge-native/x86_64-pc-windows-msvc
+      - name: Collect exact native files
+        env:
+          NATIVE_ROOT: ${{ runner.temp }}/forge-native
+          OUTPUT_ROOT: ${{ github.workspace }}/forge-finalize
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          import stat
+          from pathlib import Path
+
+          targets = {
+              "x86_64-unknown-linux-musl": (
+                  "forge-0.1.0-rc.2-x86_64-unknown-linux-musl",
+                  "forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json",
+                  "builder-record-x86_64-unknown-linux-musl.json",
+              ),
+              "aarch64-unknown-linux-musl": (
+                  "forge-0.1.0-rc.2-aarch64-unknown-linux-musl",
+                  "forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json",
+                  "builder-record-aarch64-unknown-linux-musl.json",
+              ),
+              "x86_64-apple-darwin": (
+                  "forge-0.1.0-rc.2-x86_64-apple-darwin",
+                  "forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json",
+                  "builder-record-x86_64-apple-darwin.json",
+              ),
+              "aarch64-apple-darwin": (
+                  "forge-0.1.0-rc.2-aarch64-apple-darwin",
+                  "forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json",
+                  "builder-record-aarch64-apple-darwin.json",
+              ),
+              "x86_64-pc-windows-msvc": (
+                  "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe",
+                  "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json",
+                  "builder-record-x86_64-pc-windows-msvc.json",
+              ),
+          }
+          native_root = Path(os.environ["NATIVE_ROOT"])
+          output_root = Path(os.environ["OUTPUT_ROOT"])
+          output_root.mkdir(mode=0o700)
+          dist = output_root / "dist"
+          records = output_root / "records"
+          dist.mkdir(mode=0o700)
+          records.mkdir(mode=0o700)
+
+          def copy_create_only(source: Path, destination: Path) -> None:
+              descriptor = os.open(
+                  destination,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                  0o600,
+              )
+              with source.open("rb") as input_stream, os.fdopen(descriptor, "wb") as output_stream:
+                  shutil.copyfileobj(input_stream, output_stream)
+
+          for target, names in targets.items():
+              source = native_root / target
+              entries = {entry.name: entry for entry in source.iterdir()}
+              if set(entries) != set(names):
+                  raise SystemExit(f"native handoff mismatch for {target}: {sorted(entries)}")
+              if any(not stat.S_ISREG(entry.lstat().st_mode) for entry in entries.values()):
+                  raise SystemExit(f"native handoff for {target} contains a non-regular file")
+              copy_create_only(entries[names[0]], dist / names[0])
+              copy_create_only(entries[names[1]], dist / names[1])
+              copy_create_only(entries[names[2]], records / names[2])
+          PY
+      - name: Install exact Rust toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup default "$RUSTUP_TOOLCHAIN"
+          [[ "$(rustc --version | awk '{print $2}')" == "$RUSTUP_TOOLCHAIN" ]]
+          rustc --version --verbose
+      - name: Create fresh Cargo home
+        run: |
+          if [[ -e "$CARGO_HOME" ]]; then
+            echo "refusing existing Cargo home: $CARGO_HOME" >&2
+            exit 1
+          fi
+          mkdir -m 0700 "$CARGO_HOME"
+      - name: Finalize and check exact release set
+        working-directory: forge
+        run: |
+          set -euo pipefail
+          [[ -z "$(git status --porcelain=v2 --untracked-files=all --ignore-submodules=none)" ]]
+          cargo fetch --locked
+          cargo build --locked --offline -p xtask
+          target/debug/xtask release-license-check
+          target/debug/xtask release-finalize --output-dir "$DIST_DIR"
+          target/debug/xtask release-check --output-dir "$DIST_DIR"
+      - name: Upload exact finalized assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: finalized-assets
+          path: |
+            ${{ env.DIST_DIR }}/SHA256SUMS
+            ${{ env.DIST_DIR }}/THIRD-PARTY-LICENSES.txt
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-aarch64-apple-darwin
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-aarch64-unknown-linux-musl
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-x86_64-apple-darwin
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-x86_64-unknown-linux-musl
+            ${{ env.DIST_DIR }}/forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json
+            ${{ env.DIST_DIR }}/release-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+      - name: Upload exact builder records
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: builder-records
+          path: |
+            ${{ env.RECORDS_DIR }}/builder-record-aarch64-apple-darwin.json
+            ${{ env.RECORDS_DIR }}/builder-record-aarch64-unknown-linux-musl.json
+            ${{ env.RECORDS_DIR }}/builder-record-x86_64-apple-darwin.json
+            ${{ env.RECORDS_DIR }}/builder-record-x86_64-pc-windows-msvc.json
+            ${{ env.RECORDS_DIR }}/builder-record-x86_64-unknown-linux-musl.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  independent-qualify:
+    name: Independently verify candidate bytes
+    needs: finalize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      ASSETS_DIR: ${{ github.workspace }}/forge-independent/assets
+      OUTPUT_DIR: ${{ github.workspace }}/forge-independent/output
+      RECORDS_DIR: ${{ github.workspace }}/forge-independent/records
+      SOURCE_COMMIT: ${{ inputs.sourceCommit }}
+    steps:
+      - name: Check out authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: authority
+          persist-credentials: false
+          show-progress: false
+      - name: Install Python 3.14.6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.6"
+          check-latest: false
+      - name: Download finalized assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: finalized-assets
+          path: ${{ env.ASSETS_DIR }}
+      - name: Download builder records
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: builder-records
+          path: ${{ env.RECORDS_DIR }}
+      - name: Run independent authority verifier
+        working-directory: authority
+        env:
+          FORGE_AUTHORITY_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -e "$OUTPUT_DIR" ]]; then
+            echo "refusing existing qualification output: $OUTPUT_DIR" >&2
+            exit 1
+          fi
+          mkdir -m 0700 "$OUTPUT_DIR"
+          python scripts/verify_release.py \
+            --assets "$ASSETS_DIR" \
+            --builder-records "$RECORDS_DIR" \
+            --forge-commit "$SOURCE_COMMIT" \
+            --predicate-out "$OUTPUT_DIR/predicate.json" \
+            --subject-checksums-out "$OUTPUT_DIR/subject-checksums.txt"
+      - name: Upload deterministic qualification preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-preview
+          path: |
+            ${{ env.OUTPUT_DIR }}/predicate.json
+            ${{ env.OUTPUT_DIR }}/subject-checksums.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  protected-attest:
+    name: Protected re-verification and attestation
+    needs: independent-qualify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: forge-release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      ASSETS_DIR: ${{ github.workspace }}/forge-protected/assets
+      EVIDENCE_DIR: ${{ github.workspace }}/forge-protected/evidence
+      OUTPUT_DIR: ${{ github.workspace }}/forge-protected/output
+      PREVIEW_DIR: ${{ github.workspace }}/forge-protected/preview
+      RECORDS_DIR: ${{ github.workspace }}/forge-protected/records
+      SOURCE_COMMIT: ${{ inputs.sourceCommit }}
+    steps:
+      - name: Check out authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: authority
+          persist-credentials: false
+          show-progress: false
+      - name: Install Python 3.14.6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.6"
+          check-latest: false
+      - name: Download finalized assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: finalized-assets
+          path: ${{ env.ASSETS_DIR }}
+      - name: Download builder records
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: builder-records
+          path: ${{ env.RECORDS_DIR }}
+      - name: Download independent qualification preview
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: qualification-preview
+          path: ${{ env.PREVIEW_DIR }}
+      - name: Re-run protected authority verifier
+        working-directory: authority
+        env:
+          FORGE_AUTHORITY_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -e "$OUTPUT_DIR" ]]; then
+            echo "refusing existing protected output: $OUTPUT_DIR" >&2
+            exit 1
+          fi
+          mkdir -m 0700 "$OUTPUT_DIR"
+          python scripts/verify_release.py \
+            --assets "$ASSETS_DIR" \
+            --builder-records "$RECORDS_DIR" \
+            --forge-commit "$SOURCE_COMMIT" \
+            --predicate-out "$OUTPUT_DIR/predicate.json" \
+            --subject-checksums-out "$OUTPUT_DIR/subject-checksums.txt"
+          cmp "$PREVIEW_DIR/predicate.json" "$OUTPUT_DIR/predicate.json"
+          cmp "$PREVIEW_DIR/subject-checksums.txt" "$OUTPUT_DIR/subject-checksums.txt"
+      - name: Validate exact attestation inputs
+        working-directory: authority
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          policy = json.loads(Path("contracts/release-policy.json").read_bytes())
+          assets = Path(os.environ["ASSETS_DIR"])
+          checksums_path = Path(os.environ["OUTPUT_DIR"]) / "subject-checksums.txt"
+          if not checksums_path.is_file():
+              raise SystemExit("subject-checksums path is not a regular file")
+          lines = checksums_path.read_text(encoding="ascii").splitlines(keepends=True)
+          names = policy["release"]["assets"]
+          if len(lines) != len(names) or len(names) != 13:
+              raise SystemExit("subject-checksums does not contain exactly 13 subjects")
+          for line, name in zip(lines, names, strict=True):
+              match = re.fullmatch(r"([0-9a-f]{64})  ([^\r\n]+)\n", line)
+              if match is None or match.group(2) != name:
+                  raise SystemExit(f"invalid subject-checksum record for {name}")
+              if hashlib.sha256((assets / name).read_bytes()).hexdigest() != match.group(1):
+                  raise SystemExit(f"subject-checksum digest mismatch for {name}")
+          PY
+      - name: Create SLSA provenance attestation
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: ${{ env.OUTPUT_DIR }}/subject-checksums.txt
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: ${{ env.OUTPUT_DIR }}/predicate.json
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+      - name: Validate emitted attestation bundle content
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        working-directory: authority
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          bundle_path = Path(os.environ["ATTESTATION_BUNDLE"])
+          if not bundle_path.is_file() or not os.environ["ATTESTATION_ID"]:
+              raise SystemExit("attestation action did not return a bundle and repository ID")
+          expected_url = (
+              "https://github.com/jmp0xf/forge-release-authority/attestations/"
+              + os.environ["ATTESTATION_ID"]
+          )
+          if os.environ["ATTESTATION_URL"] != expected_url:
+              raise SystemExit("attestation action returned an unexpected repository URL")
+          bundle = json.loads(bundle_path.read_bytes())
+          if bundle.get("mediaType") != "application/vnd.dev.sigstore.bundle.v0.3+json":
+              raise SystemExit("attestation bundle has an unexpected media type")
+          verification = bundle.get("verificationMaterial", {})
+          certificate = verification.get("certificate", {})
+          if not certificate.get("rawBytes") or not verification.get("tlogEntries"):
+              raise SystemExit("attestation bundle lacks certificate or transparency-log evidence")
+          envelope = bundle.get("dsseEnvelope", {})
+          if envelope.get("payloadType") != "application/vnd.in-toto+json":
+              raise SystemExit("attestation bundle has an unexpected DSSE payload type")
+          if len(envelope.get("signatures", [])) != 1:
+              raise SystemExit("attestation bundle does not contain exactly one DSSE signature")
+          try:
+              payload = base64.b64decode(envelope["payload"], validate=True)
+              statement = json.loads(payload)
+          except (KeyError, ValueError, json.JSONDecodeError) as error:
+              raise SystemExit("attestation bundle has an invalid DSSE payload") from error
+          expected_subjects = []
+          checksums = Path(os.environ["OUTPUT_DIR"]) / "subject-checksums.txt"
+          for line in checksums.read_text(encoding="ascii").splitlines():
+              digest, name = line.split("  ", 1)
+              expected_subjects.append({"name": name, "digest": {"sha256": digest}})
+          predicate = json.loads(
+              (Path(os.environ["OUTPUT_DIR"]) / "predicate.json").read_bytes()
+          )
+          if statement.get("_type") != "https://in-toto.io/Statement/v1":
+              raise SystemExit("attestation statement has an unexpected type")
+          if statement.get("subject") != expected_subjects:
+              raise SystemExit("attestation statement subjects differ from verifier output")
+          if statement.get("predicateType") != "https://slsa.dev/provenance/v1":
+              raise SystemExit("attestation statement has an unexpected predicate type")
+          if statement.get("predicate") != predicate:
+              raise SystemExit("attestation statement predicate differs from verifier output")
+          PY
+      - name: Assemble exact qualification evidence
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          if [[ -e "$EVIDENCE_DIR" ]]; then
+            echo "refusing existing evidence directory: $EVIDENCE_DIR" >&2
+            exit 1
+          fi
+          mkdir -m 0700 "$EVIDENCE_DIR"
+          cp -- "$ATTESTATION_BUNDLE" "$EVIDENCE_DIR/attestation.json"
+          cp -- "$OUTPUT_DIR/predicate.json" "$EVIDENCE_DIR/predicate.json"
+          cp -- "$OUTPUT_DIR/subject-checksums.txt" "$EVIDENCE_DIR/subject-checksums.txt"
+          cp -- "$RECORDS_DIR/builder-record-aarch64-apple-darwin.json" "$EVIDENCE_DIR/"
+          cp -- "$RECORDS_DIR/builder-record-aarch64-unknown-linux-musl.json" "$EVIDENCE_DIR/"
+          cp -- "$RECORDS_DIR/builder-record-x86_64-apple-darwin.json" "$EVIDENCE_DIR/"
+          cp -- "$RECORDS_DIR/builder-record-x86_64-pc-windows-msvc.json" "$EVIDENCE_DIR/"
+          cp -- "$RECORDS_DIR/builder-record-x86_64-unknown-linux-musl.json" "$EVIDENCE_DIR/"
+      - name: Upload qualified release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualified-release-v0.1.0-rc.2
+          path: |
+            ${{ env.ASSETS_DIR }}/SHA256SUMS
+            ${{ env.ASSETS_DIR }}/THIRD-PARTY-LICENSES.txt
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-aarch64-apple-darwin
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-aarch64-unknown-linux-musl
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-x86_64-apple-darwin
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-x86_64-unknown-linux-musl
+            ${{ env.ASSETS_DIR }}/forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json
+            ${{ env.ASSETS_DIR }}/release-manifest.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-evidence-v0.1.0-rc.2
+          path: |
+            ${{ env.EVIDENCE_DIR }}/attestation.json
+            ${{ env.EVIDENCE_DIR }}/builder-record-aarch64-apple-darwin.json
+            ${{ env.EVIDENCE_DIR }}/builder-record-aarch64-unknown-linux-musl.json
+            ${{ env.EVIDENCE_DIR }}/builder-record-x86_64-apple-darwin.json
+            ${{ env.EVIDENCE_DIR }}/builder-record-x86_64-pc-windows-msvc.json
+            ${{ env.EVIDENCE_DIR }}/builder-record-x86_64-unknown-linux-musl.json
+            ${{ env.EVIDENCE_DIR }}/predicate.json
+            ${{ env.EVIDENCE_DIR }}/subject-checksums.txt
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
