@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 QUALIFY_WORKFLOW = ROOT / ".github" / "workflows" / "qualify.yml"
+VERIFY_WORKFLOW = ROOT / ".github" / "workflows" / "verify.yml"
 WORKFLOW_DIRECTORY = ROOT / ".github" / "workflows"
 POLICY_PATH = ROOT / "contracts" / "release-policy.json"
 ALLOWED_ACTIONS = {
@@ -63,6 +64,33 @@ class QualifyWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(reference), 40)
                 seen.add(action)
         self.assertEqual(seen, set(ALLOWED_ACTIONS))
+
+    def test_verify_workflow_has_required_windows_observation_gate(self) -> None:
+        qualify = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
+        verify = VERIFY_WORKFLOW.read_text(encoding="utf-8")
+        windows = _job_blocks(verify)["windows-observation"]
+        qualification_python_versions = set(
+            re.findall(r'^\s+python-version: "([^"]+)"$', qualify, re.MULTILINE)
+        )
+
+        self.assertEqual(qualification_python_versions, {"3.14.6"})
+        self.assertEqual(windows.count("    name: Windows observation\n"), 1)
+        self.assertEqual(windows.count("    runs-on: windows-2025\n"), 1)
+        self.assertEqual(windows.count('          python-version: "3.14.6"\n'), 1)
+        self.assertEqual(windows.count("          check-latest: false\n"), 1)
+        self.assertIn(
+            "test_hash_budget_hashes_real_executable_suffix",
+            windows,
+        )
+        self.assertIn(
+            "test_hash_budget_accepts_windows_path_and_descriptor_projections",
+            windows,
+        )
+        self.assertIn("test_hash_budget_rejects_same_view_metadata_changes", windows)
+        self.assertIn(
+            "test_cross_view_snapshot_rejects_unknown_or_different_objects",
+            windows,
+        )
 
     def test_only_protected_job_has_signing_permissions(self) -> None:
         workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
