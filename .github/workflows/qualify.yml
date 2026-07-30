@@ -106,6 +106,7 @@ jobs:
       BINARY: ${{ matrix.binary }}
       CARGO_HOME: ${{ github.workspace }}/native-cargo-home
       HANDOFF_DIR: ${{ github.workspace }}/native-handoff
+      OBSERVATION_DIR: ${{ github.workspace }}/canary-observation
       RECORD: ${{ matrix.record }}
       SBOM: ${{ matrix.sbom }}
       SOURCE_COMMIT: ${{ inputs.sourceCommit }}
@@ -244,6 +245,13 @@ jobs:
           if any(not stat.S_ISREG(entry.lstat().st_mode) for entry in entries.values()):
               raise SystemExit("native handoff contains a non-regular file")
           PY
+          python "$GITHUB_WORKSPACE/authority/scripts/write_canary_observation.py" \
+            --authority-commit "$AUTHORITY_COMMIT" \
+            --binary "$STAGE_DIR/$BINARY" \
+            --cargo-home "$CARGO_HOME" \
+            --output-dir "$OBSERVATION_DIR" \
+            --source-commit "$SOURCE_COMMIT" \
+            --target "$TARGET"
       - name: Check, test, and stage native assets on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -286,6 +294,24 @@ jobs:
           if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
             throw "native handoff names do not match the fixed contract"
           }
+          python "$env:GITHUB_WORKSPACE\authority\scripts\write_canary_observation.py" `
+            --authority-commit $env:AUTHORITY_COMMIT `
+            --binary (Join-Path $env:STAGE_DIR $env:BINARY) `
+            --cargo-home $env:CARGO_HOME `
+            --output-dir $env:OBSERVATION_DIR `
+            --source-commit $env:SOURCE_COMMIT `
+            --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload canary runner observation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: canary-observation-${{ matrix.target }}
+          path: ${{ github.workspace }}/canary-observation/runner-observation-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
       - name: Upload fixed native handoff
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
