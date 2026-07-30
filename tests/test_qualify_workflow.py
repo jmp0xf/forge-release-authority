@@ -78,6 +78,9 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertEqual(windows.count("    runs-on: windows-2025\n"), 1)
         self.assertEqual(windows.count('          python-version: "3.14.6"\n'), 1)
         self.assertEqual(windows.count("          check-latest: false\n"), 1)
+        self.assertNotIn("continue-on-error", windows)
+        self.assertNotIn("\n    if:", windows)
+        self.assertNotIn("\n    needs:", windows)
         self.assertIn(
             "test_hash_budget_hashes_real_executable_suffix",
             windows,
