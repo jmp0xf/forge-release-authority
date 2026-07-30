@@ -20,6 +20,7 @@ import stat
 import struct
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 
@@ -36,11 +37,288 @@ LOWER_GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 SPDX_EXPRESSION = re.compile(r"[A-Za-z0-9.+() -]+\Z")
 MAX_AUTHORITY_POLICY_BYTES = 1024 * 1024
-MAX_SBOM_COMPONENTS = 100_000
+MAX_SBOM_COMPONENTS = 512
+MAX_SBOM_DEPENDENCY_EDGES = 4_096
+MAX_ELF_PROGRAM_HEADERS = 128
+MAX_ELF_DYNAMIC_TABLE_BYTES = 1024 * 1024
+MAX_MACHO_LOAD_COMMANDS = 256
+MAX_MACHO_LOAD_COMMAND_BYTES = 1024 * 1024
+MAX_PE_SECTIONS = 96
+MAX_JSON_INTEGER_CHARACTERS = 64
+MAX_DIRECTORY_ANCESTORS = 1024
+
+StatIdentity = tuple[int, int, int, int, int, int]
+ObjectIdentity = tuple[int, int, int]
 
 
 class VerificationError(ValueError):
     """An input did not satisfy the frozen qualification contract."""
+
+
+@dataclass(frozen=True)
+class _PinnedDirectory:
+    """A directory whose actual inode is held independently of later path changes."""
+
+    requested_path: Path
+    resolved_path: Path
+    directory_fd: int
+    directory_identity: ObjectIdentity
+    label: str
+
+
+@dataclass(frozen=True)
+class _PinnedOutput:
+    """One create-only output addressed relative to a held parent directory."""
+
+    requested_directory: Path
+    directory: Path
+    directory_fd: int
+    directory_identity: ObjectIdentity
+    name: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class _CreatedOutput:
+    """A create-only output kept open until the complete output set is verified."""
+
+    output: _PinnedOutput
+    file_fd: int
+    identity: StatIdentity
+    expected_length: int
+    expected_sha256: str
+
+
+def _require_secure_posix_fs_capabilities() -> None:
+    """Fail closed unless every filesystem primitive used for qualification exists."""
+    missing: list[str] = []
+    if os.name != "posix":
+        missing.append("POSIX")
+    for name in ("O_DIRECTORY", "O_NOFOLLOW"):
+        value = getattr(os, name, None)
+        if not isinstance(value, int) or value == 0:
+            missing.append(name)
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+    supports_fd = getattr(os, "supports_fd", ())
+    if os.open not in supports_dir_fd:
+        missing.append("open(dir_fd)")
+    if os.stat not in supports_dir_fd:
+        missing.append("stat(dir_fd)")
+    if os.stat not in supports_follow_symlinks:
+        missing.append("stat(follow_symlinks=False)")
+    if os.scandir not in supports_fd:
+        missing.append("scandir(fd)")
+    if not callable(getattr(os, "geteuid", None)):
+        missing.append("geteuid")
+    if missing:
+        raise VerificationError(
+            "required secure POSIX filesystem capabilities unavailable: "
+            + ", ".join(missing)
+        )
+
+
+def _stat_identity(value: os.stat_result) -> StatIdentity:
+    """Return the stable metadata that must not change while an input is read."""
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _object_identity(value: os.stat_result) -> ObjectIdentity:
+    """Identify an object while allowing intentional directory-content changes."""
+    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)
+
+
+def _fstat(file_fd: int, label: str) -> os.stat_result:
+    try:
+        return os.fstat(file_fd)
+    except OSError as error:
+        raise VerificationError(f"cannot inspect {label}: {error}") from error
+
+
+def _close_fd(file_fd: int) -> None:
+    """Release one owned fd once; close errors have platform-dependent state."""
+    try:
+        os.close(file_fd)
+    except OSError:
+        pass
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_resolved_directory(resolved_path: Path, label: str) -> int:
+    """Open every component of an absolute resolved path without following links."""
+    if not resolved_path.is_absolute():
+        raise VerificationError(f"{label} resolved path must be absolute")
+    flags = _directory_open_flags()
+    try:
+        current_fd = os.open(resolved_path.anchor, flags)
+    except OSError as error:
+        raise VerificationError(f"cannot securely open {label}: {error}") from error
+    try:
+        for component in resolved_path.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except OSError as error:
+                raise VerificationError(
+                    f"cannot securely traverse {label}: {error}"
+                ) from error
+            previous_fd = current_fd
+            current_fd = next_fd
+            try:
+                os.close(previous_fd)
+            except OSError as error:
+                raise VerificationError(
+                    f"cannot release a traversed component of {label}: {error}"
+                ) from error
+        return current_fd
+    except BaseException:
+        _close_fd(current_fd)
+        raise
+
+
+def _pin_directory(path: Path, label: str) -> _PinnedDirectory:
+    """Resolve a path for diagnostics, then bind all work to its opened inode."""
+    _require_secure_posix_fs_capabilities()
+    requested_path = Path(os.path.abspath(path))
+    try:
+        requested_visible = requested_path.lstat()
+        resolved_path = requested_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise VerificationError(f"cannot inspect {label} {path}: {error}") from error
+    if stat.S_ISLNK(requested_visible.st_mode) or not stat.S_ISDIR(
+        requested_visible.st_mode
+    ):
+        raise VerificationError(f"{label} must be a non-symlink directory")
+
+    directory_fd = _open_resolved_directory(resolved_path, label)
+    try:
+        opened = _fstat(directory_fd, label)
+        if not stat.S_ISDIR(opened.st_mode) or _stat_identity(opened) != _stat_identity(
+            requested_visible
+        ):
+            raise VerificationError(f"{label} changed before it was opened")
+        try:
+            visible_resolved_path = requested_path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise VerificationError(f"cannot re-inspect {label}: {error}") from error
+        if visible_resolved_path != resolved_path:
+            raise VerificationError(f"{label} path changed while it was opened")
+        return _PinnedDirectory(
+            requested_path=requested_path,
+            resolved_path=resolved_path,
+            directory_fd=directory_fd,
+            directory_identity=_object_identity(opened),
+            label=label,
+        )
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _close_pinned_directory(directory: _PinnedDirectory) -> None:
+    _close_fd(directory.directory_fd)
+
+
+def _require_pinned_directory_path_stable(directory: _PinnedDirectory) -> None:
+    """Require the diagnostic path to reopen to the inode already being used."""
+    reopened = _pin_directory(directory.requested_path, directory.label)
+    try:
+        opened = _fstat(directory.directory_fd, directory.label)
+        if (
+            _object_identity(opened) != directory.directory_identity
+            or reopened.directory_identity != directory.directory_identity
+            or reopened.resolved_path != directory.resolved_path
+        ):
+            raise VerificationError(
+                f"{directory.label} path changed during verification"
+            )
+    finally:
+        _close_pinned_directory(reopened)
+
+
+def _directory_is_same_or_descendant(
+    directory_fd: int, possible_ancestor: ObjectIdentity
+) -> bool:
+    """Walk parent inodes from a held fd; never infer ancestry from path strings."""
+    try:
+        current_fd = os.dup(directory_fd)
+    except OSError as error:
+        raise VerificationError(
+            f"cannot inspect qualification directory ancestry: {error}"
+        ) from error
+    try:
+        for _depth in range(MAX_DIRECTORY_ANCESTORS):
+            try:
+                current_identity = _object_identity(
+                    _fstat(current_fd, "qualification directory ancestry")
+                )
+            except OSError as error:
+                raise VerificationError(
+                    f"cannot inspect qualification directory ancestry: {error}"
+                ) from error
+            if current_identity == possible_ancestor:
+                return True
+            parent_fd: int | None = None
+            try:
+                parent_fd = os.open("..", _directory_open_flags(), dir_fd=current_fd)
+                parent_identity = _object_identity(
+                    _fstat(parent_fd, "qualification directory ancestry")
+                )
+            except VerificationError:
+                if parent_fd is not None:
+                    _close_fd(parent_fd)
+                raise
+            except OSError as error:
+                if parent_fd is not None:
+                    _close_fd(parent_fd)
+                raise VerificationError(
+                    f"cannot inspect qualification directory ancestry: {error}"
+                ) from error
+            if parent_identity == current_identity:
+                _close_fd(parent_fd)
+                return False
+            previous_fd = current_fd
+            current_fd = parent_fd
+            try:
+                os.close(previous_fd)
+            except OSError as error:
+                raise VerificationError(
+                    f"cannot release qualification directory ancestry: {error}"
+                ) from error
+    finally:
+        _close_fd(current_fd)
+    raise VerificationError(
+        f"qualification directory ancestry exceeds {MAX_DIRECTORY_ANCESTORS} levels"
+    )
+
+
+def _bounded_directory_names(
+    directory_fd: int, maximum_count: int, label: str
+) -> list[str]:
+    """Enumerate no more than the exact contract can accept."""
+    names: list[str] = []
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if len(names) >= maximum_count:
+                    raise VerificationError(
+                        f"{label} contains more than {maximum_count} entries"
+                    )
+                names.append(entry.name)
+    except VerificationError:
+        raise
+    except OSError as error:
+        raise VerificationError(f"cannot enumerate {label}: {error}") from error
+    return sorted(names)
 
 
 def _duplicate_rejecting_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
@@ -66,11 +344,21 @@ def _load_json_bytes(data: bytes, label: str) -> Any:
             text,
             object_pairs_hook=_duplicate_rejecting_object,
             parse_constant=_reject_json_constant,
+            parse_int=_parse_bounded_json_integer,
         )
     except VerificationError:
         raise
-    except (json.JSONDecodeError, RecursionError) as error:
+    except (json.JSONDecodeError, RecursionError, ValueError) as error:
         raise VerificationError(f"{label} is not valid JSON: {error}") from error
+
+
+def _parse_bounded_json_integer(value: str) -> int:
+    """Parse an integer only after bounding conversion work across Python versions."""
+    if len(value) > MAX_JSON_INTEGER_CHARACTERS:
+        raise VerificationError(
+            "JSON integer exceeds the 64-character qualification limit"
+        )
+    return int(value, 10)
 
 
 def _require_object(value: Any, path: str) -> dict[str, Any]:
@@ -161,57 +449,16 @@ def _canonical_json(value: Any) -> bytes:
 
 
 def _read_bounded_regular_path(path: Path, limit: int, label: str) -> bytes:
+    name = _require_safe_basename(path.name, f"{label} name")
+    parent = _pin_directory(path.parent, f"{label} parent directory")
     try:
-        metadata = path.lstat()
-    except OSError as error:
-        raise VerificationError(f"cannot inspect {label} {path}: {error}") from error
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise VerificationError(f"{label} must be a non-symlink regular file")
-    if metadata.st_size <= 0 or metadata.st_size > limit:
-        raise VerificationError(f"{label} is empty or exceeds its {limit}-byte limit")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        file_fd = os.open(path, flags)
-    except OSError as error:
-        raise VerificationError(
-            f"cannot securely open {label} {path}: {error}"
-        ) from error
-    try:
-        before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode) or (before.st_dev, before.st_ino) != (
-            metadata.st_dev,
-            metadata.st_ino,
-        ):
-            raise VerificationError(f"{label} changed before it was opened")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(file_fd, min(1024 * 1024, limit - total + 1))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > limit:
-                raise VerificationError(f"{label} exceeds its {limit}-byte limit")
-        after = os.fstat(file_fd)
+        data, _identity = _read_regular_file_at(
+            parent.directory_fd, name, limit, limit, label
+        )
+        _require_pinned_directory_path_stable(parent)
+        return data
     finally:
-        os.close(file_fd)
-    try:
-        visible_after = path.lstat()
-    except OSError as error:
-        raise VerificationError(f"cannot re-inspect {label} {path}: {error}") from error
-
-    def identity(value: os.stat_result) -> tuple[int, int, int, int]:
-        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
-
-    if (
-        identity(metadata) != identity(before)
-        or identity(before) != identity(after)
-        or identity(after) != identity(visible_after)
-        or total != before.st_size
-    ):
-        raise VerificationError(f"{label} changed while it was read")
-    return b"".join(chunks)
+        _close_pinned_directory(parent)
 
 
 def load_policy(path: Path) -> tuple[dict[str, Any], str]:
@@ -392,7 +639,10 @@ def _validate_policy(policy: dict[str, Any]) -> None:
             sbom_graph["dependencyEdgeCount"],
             f"{path}.sbomGraph.dependencyEdgeCount",
         )
-        if dependency_edge_count <= 0 or dependency_edge_count > MAX_SBOM_COMPONENTS**2:
+        if (
+            dependency_edge_count <= 0
+            or dependency_edge_count > MAX_SBOM_DEPENDENCY_EDGES
+        ):
             raise VerificationError(
                 f"{path}.sbomGraph.dependencyEdgeCount is outside the accepted range"
             )
@@ -452,64 +702,127 @@ def _validate_policy(policy: dict[str, Any]) -> None:
         "manifestBytes",
         "checksumsBytes",
         "builderRecordBytes",
+        "totalAssetBytes",
+        "totalBuilderRecordBytes",
     }
     _require_keys(limits, expected_limits, "policy.limits")
+    validated_limits: dict[str, int] = {}
     for key in expected_limits:
         limit_value = _require_integer(limits[key], f"policy.limits.{key}")
         if limit_value <= 0 or limit_value > 4 * 1024 * 1024 * 1024:
             raise VerificationError(
                 f"policy.limits.{key} is outside the accepted range"
             )
+        validated_limits[key] = limit_value
+    maximum_asset_total = (
+        5 * validated_limits["binaryBytes"]
+        + 5 * validated_limits["sbomBytes"]
+        + validated_limits["noticeBytes"]
+        + validated_limits["manifestBytes"]
+        + validated_limits["checksumsBytes"]
+    )
+    if validated_limits["totalAssetBytes"] > maximum_asset_total:
+        raise VerificationError(
+            "policy.limits.totalAssetBytes exceeds the sum of all per-file limits"
+        )
+    if (
+        validated_limits["totalBuilderRecordBytes"]
+        > 5 * validated_limits["builderRecordBytes"]
+    ):
+        raise VerificationError(
+            "policy.limits.totalBuilderRecordBytes exceeds the five-record limit"
+        )
 
 
 def _read_exact_directory(
     directory: Path,
     expected_names: Sequence[str],
     size_limit: Callable[[str], int],
+    total_limit: int,
     label: str,
 ) -> dict[str, bytes]:
+    pinned = _pin_directory(directory, f"{label} directory")
     try:
-        metadata = directory.lstat()
-    except OSError as error:
-        raise VerificationError(
-            f"cannot inspect {label} directory {directory}: {error}"
-        ) from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise VerificationError(f"{label} path must be a non-symlink directory")
-
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        directory_fd = os.open(directory, flags)
-    except OSError as error:
-        raise VerificationError(
-            f"cannot securely open {label} directory: {error}"
-        ) from error
-    try:
-        names = sorted(os.listdir(directory_fd))
-        _require_unique_casefold(names, f"{label} directory")
-        expected = sorted(expected_names)
-        if names != expected:
-            raise VerificationError(
-                f"{label} file set differs from policy; missing={sorted(set(expected) - set(names))}, "
-                f"extra={sorted(set(names) - set(expected))}"
-            )
-        result: dict[str, bytes] = {}
-        for name in expected:
-            result[name] = _read_regular_file_at(
-                directory_fd, name, size_limit(name), f"{label}/{name}"
-            )
-        if sorted(os.listdir(directory_fd)) != expected:
-            raise VerificationError(f"{label} directory changed during verification")
-        return result
+        return _read_exact_pinned_directory(
+            pinned, expected_names, size_limit, total_limit, label
+        )
     finally:
-        os.close(directory_fd)
+        _close_pinned_directory(pinned)
+
+
+def _read_exact_pinned_directory(
+    directory: _PinnedDirectory,
+    expected_names: Sequence[str],
+    size_limit: Callable[[str], int],
+    total_limit: int,
+    label: str,
+) -> dict[str, bytes]:
+    """Read one exact directory snapshot through its already-held inode."""
+    if total_limit <= 0:
+        raise VerificationError(f"{label} total byte limit must be positive")
+    directory_before = _fstat(directory.directory_fd, f"{label} directory")
+    if (
+        not stat.S_ISDIR(directory_before.st_mode)
+        or _object_identity(directory_before) != directory.directory_identity
+    ):
+        raise VerificationError(f"{label} directory changed before it was read")
+    expected = sorted(expected_names)
+    names = _bounded_directory_names(directory.directory_fd, len(expected), label)
+    _require_unique_casefold(names, f"{label} directory")
+    if names != expected:
+        raise VerificationError(
+            f"{label} file set differs from policy; missing={sorted(set(expected) - set(names))}, "
+            f"extra={sorted(set(names) - set(expected))}"
+        )
+    result: dict[str, bytes] = {}
+    entry_identities: dict[str, StatIdentity] = {}
+    total = 0
+    for name in expected:
+        data, identity = _read_regular_file_at(
+            directory.directory_fd,
+            name,
+            size_limit(name),
+            total_limit - total,
+            f"{label}/{name}",
+        )
+        total += len(data)
+        if total > total_limit:
+            raise VerificationError(
+                f"{label} exceeds its {total_limit}-byte total policy limit"
+            )
+        result[name] = data
+        entry_identities[name] = identity
+    if (
+        _bounded_directory_names(directory.directory_fd, len(expected), label)
+        != expected
+    ):
+        raise VerificationError(f"{label} directory changed during verification")
+    for name in expected:
+        try:
+            visible_final = os.stat(
+                name, dir_fd=directory.directory_fd, follow_symlinks=False
+            )
+        except OSError as error:
+            raise VerificationError(
+                f"cannot re-inspect {label}/{name}: {error}"
+            ) from error
+        if _stat_identity(visible_final) != entry_identities[name]:
+            raise VerificationError(f"{label}/{name} changed after it was read")
+    directory_after = _fstat(directory.directory_fd, f"{label} directory")
+    if _stat_identity(directory_before) != _stat_identity(directory_after):
+        raise VerificationError(f"{label} directory changed during verification")
+    _require_pinned_directory_path_stable(directory)
+    return result
 
 
 def _read_regular_file_at(
-    directory_fd: int, name: str, limit: int, label: str
-) -> bytes:
+    directory_fd: int,
+    name: str,
+    limit: int,
+    remaining_total: int,
+    label: str,
+) -> tuple[bytes, StatIdentity]:
+    _require_secure_posix_fs_capabilities()
     try:
         visible = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except OSError as error:
@@ -520,36 +833,52 @@ def _read_regular_file_at(
         raise VerificationError(f"{label} must not be empty")
     if visible.st_size > limit:
         raise VerificationError(f"{label} exceeds its {limit}-byte policy limit")
+    if visible.st_size > remaining_total:
+        raise VerificationError(f"{label} exceeds the remaining directory total limit")
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | os.O_NOFOLLOW
     try:
         file_fd = os.open(name, flags, dir_fd=directory_fd)
     except OSError as error:
         raise VerificationError(f"cannot securely open {label}: {error}") from error
     try:
-        before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise VerificationError(f"{label} changed to a non-regular file")
+        before = _fstat(file_fd, label)
+        if not stat.S_ISREG(before.st_mode) or _stat_identity(
+            visible
+        ) != _stat_identity(before):
+            raise VerificationError(f"{label} changed before it was opened")
         chunks: list[bytes] = []
         total = 0
+        read_limit = min(limit, remaining_total)
         while True:
-            chunk = os.read(file_fd, min(1024 * 1024, limit - total + 1))
+            chunk = os.read(file_fd, min(1024 * 1024, read_limit - total + 1))
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if total > limit:
+            if total > read_limit:
+                if remaining_total < limit:
+                    raise VerificationError(
+                        f"{label} exceeds the remaining directory total limit"
+                    )
                 raise VerificationError(
                     f"{label} exceeds its {limit}-byte policy limit"
                 )
-        after = os.fstat(file_fd)
+        after = _fstat(file_fd, label)
+        try:
+            visible_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise VerificationError(f"cannot re-inspect {label}: {error}") from error
     finally:
         os.close(file_fd)
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_after or total != before.st_size:
+    identity = _stat_identity(before)
+    if (
+        identity != _stat_identity(after)
+        or identity != _stat_identity(visible_after)
+        or total != before.st_size
+    ):
         raise VerificationError(f"{label} changed while it was read")
-    return b"".join(chunks)
+    return b"".join(chunks), identity
 
 
 def _asset_limit(
@@ -983,7 +1312,13 @@ def _validate_sbom(
     if DECIMAL.fullmatch(binary_length) is None or int(binary_length) != len(binary):
         raise VerificationError(f"{prefix}.binary-length does not match the binary")
 
+    graph_contract = target["sbomGraph"]
     components = _require_list(bom["components"], f"SBOM {label}.components")
+    if len(components) + 1 != graph_contract["componentCount"]:
+        raise VerificationError(
+            f"SBOM {label} has {len(components) + 1} semantic components; "
+            f"policy requires {graph_contract['componentCount']}"
+        )
     references = {root_ref}
     components_by_ref = {
         root_ref: _sbom_graph_node(
@@ -1085,12 +1420,22 @@ def _validate_sbom(
         )
     graph: dict[str, list[str]] = {}
     dependency_order: list[str] = []
+    running_edge_count = 0
     for index, raw_dependency in enumerate(dependencies):
         item_path = f"SBOM {label}.dependencies[{index}]"
         item = _require_object(raw_dependency, item_path)
         _require_keys(item, {"ref", "dependsOn"}, item_path)
         reference = _require_string(item["ref"], f"{item_path}.ref")
         depends_on = _require_list(item["dependsOn"], f"{item_path}.dependsOn")
+        running_edge_count += len(depends_on)
+        if running_edge_count > MAX_SBOM_DEPENDENCY_EDGES:
+            raise VerificationError(
+                f"SBOM {label} exceeds the {MAX_SBOM_DEPENDENCY_EDGES}-edge complexity limit"
+            )
+        if running_edge_count > graph_contract["dependencyEdgeCount"]:
+            raise VerificationError(
+                f"SBOM {label} has more dependency edges than policy permits"
+            )
         for edge_index, edge in enumerate(depends_on):
             _require_string(edge, f"{item_path}.dependsOn[{edge_index}]")
         if depends_on != sorted(set(depends_on)):
@@ -1102,6 +1447,11 @@ def _validate_sbom(
     if dependency_order != sorted(references) or set(graph) != references:
         raise VerificationError(
             f"SBOM {label}.dependencies is not the sorted exact reference set"
+        )
+    if running_edge_count != graph_contract["dependencyEdgeCount"]:
+        raise VerificationError(
+            f"SBOM {label} has {running_edge_count} dependency edges; "
+            f"policy requires {graph_contract['dependencyEdgeCount']}"
         )
     for reference, edges in graph.items():
         unknown = set(edges) - references
@@ -1121,18 +1471,11 @@ def _validate_sbom(
         raise VerificationError(
             f"SBOM {label} contains components unreachable from Forge"
         )
-    graph_contract = target["sbomGraph"]
     component_count = len(components_by_ref)
-    dependency_edge_count = sum(len(dependencies) for dependencies in graph.values())
     if component_count != graph_contract["componentCount"]:
         raise VerificationError(
             f"SBOM {label} has {component_count} semantic components; "
             f"policy requires {graph_contract['componentCount']}"
-        )
-    if dependency_edge_count != graph_contract["dependencyEdgeCount"]:
-        raise VerificationError(
-            f"SBOM {label} has {dependency_edge_count} dependency edges; "
-            f"policy requires {graph_contract['dependencyEdgeCount']}"
         )
     _, _, canonical_graph_sha256 = _canonical_sbom_graph_contract(
         root_ref, components_by_ref, graph
@@ -1177,6 +1520,10 @@ def _validate_elf(target: Mapping[str, Any], data: bytes) -> None:
     program_offset = struct.unpack_from("<Q", data, 32)[0]
     entry_size = struct.unpack_from("<H", data, 54)[0]
     entry_count = struct.unpack_from("<H", data, 56)[0]
+    if entry_count > MAX_ELF_PROGRAM_HEADERS:
+        raise VerificationError(
+            f"{target['binary']} exceeds the {MAX_ELF_PROGRAM_HEADERS}-header ELF complexity limit"
+        )
     if (
         entrypoint == 0
         or program_offset < 64
@@ -1190,6 +1537,7 @@ def _validate_elf(target: Mapping[str, Any], data: bytes) -> None:
     executable_load = False
     executable_entrypoint = False
     dynamic_ranges: list[tuple[int, int]] = []
+    dynamic_bytes_total = 0
     for index in range(entry_count):
         offset = program_offset + index * entry_size
         program_type, flags = struct.unpack_from("<II", data, offset)
@@ -1235,7 +1583,20 @@ def _validate_elf(target: Mapping[str, Any], data: bytes) -> None:
                 raise VerificationError(
                     f"{target['binary']} has an invalid ELF dynamic table"
                 )
-            dynamic_ranges.append((file_offset, file_size))
+            dynamic_end = file_offset + file_size
+            if any(
+                file_offset < previous_end and previous_start < dynamic_end
+                for previous_start, previous_end in dynamic_ranges
+            ):
+                raise VerificationError(
+                    f"{target['binary']} has overlapping ELF dynamic tables"
+                )
+            dynamic_bytes_total += file_size
+            if dynamic_bytes_total > MAX_ELF_DYNAMIC_TABLE_BYTES:
+                raise VerificationError(
+                    f"{target['binary']} exceeds the ELF dynamic-table complexity limit"
+                )
+            dynamic_ranges.append((file_offset, dynamic_end))
     if not executable_load:
         raise VerificationError(
             f"{target['binary']} has no file-backed executable ELF load segment"
@@ -1244,9 +1605,9 @@ def _validate_elf(target: Mapping[str, Any], data: bytes) -> None:
         raise VerificationError(
             f"{target['binary']} entry point is outside executable ELF load segments"
         )
-    for dynamic_offset, dynamic_size in dynamic_ranges:
+    for dynamic_offset, dynamic_end in dynamic_ranges:
         terminated = False
-        for offset in range(dynamic_offset, dynamic_offset + dynamic_size, 16):
+        for offset in range(dynamic_offset, dynamic_end, 16):
             tag = struct.unpack_from("<q", data, offset)[0]
             if tag == 0:  # DT_NULL
                 terminated = True
@@ -1273,6 +1634,13 @@ def _validate_macho(target: Mapping[str, Any], data: bytes) -> None:
     file_type, command_count, command_bytes = struct.unpack_from("<III", data, 12)
     if file_type != 2:  # MH_EXECUTE
         raise VerificationError(f"{target['binary']} is not a Mach-O executable")
+    if (
+        command_count > MAX_MACHO_LOAD_COMMANDS
+        or command_bytes > MAX_MACHO_LOAD_COMMAND_BYTES
+    ):
+        raise VerificationError(
+            f"{target['binary']} exceeds the Mach-O load-command complexity limit"
+        )
     commands_end = 32 + command_bytes
     if (
         command_count == 0
@@ -1363,6 +1731,10 @@ def _validate_pe(target: Mapping[str, Any], data: bytes) -> None:
     section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
     optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
     characteristics = struct.unpack_from("<H", data, pe_offset + 22)[0]
+    if section_count > MAX_PE_SECTIONS:
+        raise VerificationError(
+            f"{target['binary']} exceeds the {MAX_PE_SECTIONS}-section PE limit"
+        )
     optional_offset = pe_offset + 24
     optional_end = optional_offset + optional_size
     if (
@@ -1603,12 +1975,12 @@ def _render_subject_checksums(
     ).encode("ascii")
 
 
-def _verify_release_with_subjects(
+def _verify_release_with_pinned_directories(
     policy_path: Path,
     cargo_lock_path: Path,
     source_license_notices_path: Path,
-    assets_directory: Path,
-    builder_records_directory: Path,
+    assets_directory: _PinnedDirectory,
+    builder_records_directory: _PinnedDirectory,
     forge_commit: str,
     authority_commit: str,
 ) -> tuple[dict[str, Any], bytes]:
@@ -1626,17 +1998,19 @@ def _verify_release_with_subjects(
         "trusted source license notices",
     )
     _, target_by_asset = _target_maps(policy)
-    assets = _read_exact_directory(
+    assets = _read_exact_pinned_directory(
         assets_directory,
         policy["release"]["assets"],
         lambda name: _asset_limit(policy, target_by_asset, name),
+        policy["limits"]["totalAssetBytes"],
         "release assets",
     )
     record_names = [target["builderRecord"] for target in policy["targets"]]
-    records = _read_exact_directory(
+    records = _read_exact_pinned_directory(
         builder_records_directory,
         record_names,
         lambda _name: policy["limits"]["builderRecordBytes"],
+        policy["limits"]["totalBuilderRecordBytes"],
         "builder records",
     )
 
@@ -1684,6 +2058,35 @@ def _verify_release_with_subjects(
     )
 
 
+def _verify_release_with_subjects(
+    policy_path: Path,
+    cargo_lock_path: Path,
+    source_license_notices_path: Path,
+    assets_directory: Path,
+    builder_records_directory: Path,
+    forge_commit: str,
+    authority_commit: str,
+) -> tuple[dict[str, Any], bytes]:
+    """Verify through directory inodes pinned for the complete read operation."""
+    assets = _pin_directory(assets_directory, "release assets directory")
+    try:
+        records = _pin_directory(builder_records_directory, "builder records directory")
+        try:
+            return _verify_release_with_pinned_directories(
+                policy_path,
+                cargo_lock_path,
+                source_license_notices_path,
+                assets,
+                records,
+                forge_commit,
+                authority_commit,
+            )
+        finally:
+            _close_pinned_directory(records)
+    finally:
+        _close_pinned_directory(assets)
+
+
 def verify_release(
     policy_path: Path,
     cargo_lock_path: Path,
@@ -1706,60 +2109,210 @@ def verify_release(
     return predicate
 
 
-def _write_create_only(path: Path, data: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+def _pin_output(
+    output: Path, input_directories: Sequence[_PinnedDirectory]
+) -> _PinnedOutput:
+    """Hold an actual output-parent inode outside every verified input inode."""
+    name = _require_safe_basename(output.name, "qualification output name")
+    pinned = _pin_directory(output.parent, "qualification output parent")
     try:
-        file_fd = os.open(path, flags, 0o644)
+        if any(
+            _directory_is_same_or_descendant(
+                pinned.directory_fd, input_directory.directory_identity
+            )
+            for input_directory in input_directories
+        ):
+            raise VerificationError(
+                "qualification outputs must be outside the verified input directories"
+            )
+        return _PinnedOutput(
+            requested_directory=pinned.requested_path,
+            directory=pinned.resolved_path,
+            directory_fd=pinned.directory_fd,
+            directory_identity=pinned.directory_identity,
+            name=name,
+            path=pinned.requested_path / name,
+        )
+    except BaseException:
+        _close_pinned_directory(pinned)
+        raise
+
+
+def _require_pinned_output_parents_stable(
+    outputs: Sequence[_PinnedOutput], input_directories: Sequence[_PinnedDirectory]
+) -> None:
+    """Recheck held parents, visible paths, and actual inode ancestry."""
+    for output in outputs:
+        pinned = _PinnedDirectory(
+            requested_path=output.requested_directory,
+            resolved_path=output.directory,
+            directory_fd=output.directory_fd,
+            directory_identity=output.directory_identity,
+            label="qualification output parent",
+        )
+        _require_pinned_directory_path_stable(pinned)
+        if any(
+            _directory_is_same_or_descendant(
+                output.directory_fd, input_directory.directory_identity
+            )
+            for input_directory in input_directories
+        ):
+            raise VerificationError(
+                "qualification output directory moved inside a verified input directory"
+            )
+
+
+def _require_outputs_absent(outputs: Sequence[_PinnedOutput]) -> None:
+    for output in outputs:
+        try:
+            os.stat(
+                output.name,
+                dir_fd=output.directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise VerificationError(
+                f"cannot inspect qualification output {output.path}: {error}"
+            ) from error
+        raise VerificationError(
+            f"refusing to overwrite existing qualification output {output.path}"
+        )
+
+
+def _require_fresh_private_output_directories(
+    outputs: Sequence[_PinnedOutput],
+) -> None:
+    """Enforce the workflow boundary that excludes unrelated filesystem writers."""
+    seen: set[ObjectIdentity] = set()
+    for output in outputs:
+        if output.directory_identity in seen:
+            continue
+        seen.add(output.directory_identity)
+        metadata = _fstat(
+            output.directory_fd, f"qualification output directory {output.directory}"
+        )
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise VerificationError(
+                "qualification output directories must be owned by the current user "
+                "with mode 0700"
+            )
+        _bounded_directory_names(
+            output.directory_fd, 0, "qualification output directory"
+        )
+
+
+def _write_create_only(output: _PinnedOutput, data: bytes) -> _CreatedOutput:
+    """Create one output and keep its inode open for the final set-wide check."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        file_fd = os.open(
+            output.name,
+            flags,
+            0o644,
+            dir_fd=output.directory_fd,
+        )
     except OSError as error:
         raise VerificationError(
-            f"refusing to overwrite qualification output {path}: {error}"
+            f"refusing to overwrite qualification output {output.path}: {error}"
         ) from error
     try:
+        opened = _fstat(file_fd, f"qualification output {output.path}")
+        if not stat.S_ISREG(opened.st_mode):
+            raise VerificationError(
+                f"qualification output {output.path} is not a regular file"
+            )
         view = memoryview(data)
         while view:
             written = os.write(file_fd, view)
             if written <= 0:
                 raise VerificationError(
-                    f"short write while creating qualification output {path}"
+                    f"short write while creating qualification output {output.path}"
                 )
             view = view[written:]
         os.fsync(file_fd)
-    finally:
-        os.close(file_fd)
-
-
-def _require_output_outside_inputs(
-    output: Path, input_directories: Sequence[Path]
-) -> Path:
-    try:
-        parent = output.parent.resolve(strict=True)
-        resolved_inputs = [
-            directory.resolve(strict=True) for directory in input_directories
-        ]
-    except OSError as error:
-        raise VerificationError(
-            f"cannot resolve predicate output boundary: {error}"
-        ) from error
-    if parent in resolved_inputs:
-        raise VerificationError(
-            "qualification outputs must be outside the verified input directories"
+        after = _fstat(file_fd, f"qualification output {output.path}")
+        visible_after = os.stat(
+            output.name,
+            dir_fd=output.directory_fd,
+            follow_symlinks=False,
         )
-    return parent / output.name
+        identity = _stat_identity(after)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or _object_identity(opened) != _object_identity(after)
+            or identity != _stat_identity(visible_after)
+            or after.st_size != len(data)
+        ):
+            raise VerificationError(
+                f"qualification output {output.path} changed while it was written"
+            )
+        return _CreatedOutput(
+            output=output,
+            file_fd=file_fd,
+            identity=identity,
+            expected_length=len(data),
+            expected_sha256=_sha256(data),
+        )
+    except VerificationError:
+        os.close(file_fd)
+        raise
+    except OSError as error:
+        os.close(file_fd)
+        raise VerificationError(
+            f"cannot securely create qualification output {output.path}: {error}"
+        ) from error
+    except BaseException:
+        os.close(file_fd)
+        raise
 
 
-def _require_outputs_absent(outputs: Sequence[Path]) -> None:
-    for output in outputs:
+def _require_created_outputs_stable(outputs: Sequence[_CreatedOutput]) -> None:
+    """Verify both created names still expose the exact bytes written by this run."""
+    for created in outputs:
+        output = created.output
         try:
-            output.lstat()
-        except FileNotFoundError:
-            continue
+            opened = _fstat(created.file_fd, f"qualification output {output.path}")
+            visible = os.stat(
+                output.name,
+                dir_fd=output.directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _stat_identity(opened) != created.identity
+                or _stat_identity(visible) != created.identity
+                or opened.st_size != created.expected_length
+            ):
+                raise VerificationError(
+                    f"qualification output {output.path} changed before completion"
+                )
+            os.lseek(created.file_fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = created.expected_length
+            while remaining > 0:
+                chunk = os.read(created.file_fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            trailing = os.read(created.file_fd, 1)
+            final = _fstat(created.file_fd, f"qualification output {output.path}")
         except OSError as error:
             raise VerificationError(
-                f"cannot inspect qualification output {output}: {error}"
+                f"cannot re-inspect qualification output {output.path}: {error}"
             ) from error
-        raise VerificationError(
-            f"refusing to overwrite existing qualification output {output}"
-        )
+        if (
+            _stat_identity(opened) != created.identity
+            or _stat_identity(final) != created.identity
+            or _stat_identity(visible) != created.identity
+            or remaining != 0
+            or trailing
+            or _sha256(b"".join(chunks)) != created.expected_sha256
+        ):
+            raise VerificationError(
+                f"qualification output {output.path} changed before completion"
+            )
 
 
 def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
@@ -1784,33 +2337,67 @@ def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     options = _parse_arguments(arguments)
+    pinned_inputs: list[_PinnedDirectory] = []
+    pinned_outputs: list[_PinnedOutput] = []
+    created_outputs: list[_CreatedOutput] = []
     try:
-        predicate_output = _require_output_outside_inputs(
-            options.predicate_out, [options.assets, options.builder_records]
+        _require_secure_posix_fs_capabilities()
+        assets_directory = _pin_directory(options.assets, "release assets directory")
+        pinned_inputs.append(assets_directory)
+        builder_records_directory = _pin_directory(
+            options.builder_records, "builder records directory"
         )
-        subject_checksums_output = _require_output_outside_inputs(
-            options.subject_checksums_out, [options.assets, options.builder_records]
+        pinned_inputs.append(builder_records_directory)
+        predicate_output = _pin_output(options.predicate_out, pinned_inputs)
+        pinned_outputs.append(predicate_output)
+        subject_checksums_output = _pin_output(
+            options.subject_checksums_out, pinned_inputs
         )
-        if predicate_output == subject_checksums_output:
-            raise VerificationError(
-                "predicate and subject-checksum outputs must differ"
+        pinned_outputs.append(subject_checksums_output)
+        if (
+            predicate_output.directory_identity
+            == subject_checksums_output.directory_identity
+        ):
+            _require_unique_casefold(
+                [predicate_output.name, subject_checksums_output.name],
+                "qualification output names",
             )
-        _require_outputs_absent([predicate_output, subject_checksums_output])
-        predicate, subject_checksums = _verify_release_with_subjects(
+        _require_outputs_absent(pinned_outputs)
+        _require_fresh_private_output_directories(pinned_outputs)
+        predicate, subject_checksums = _verify_release_with_pinned_directories(
             options.policy,
             options.cargo_lock,
             options.source_license_notices,
-            options.assets,
-            options.builder_records,
+            assets_directory,
+            builder_records_directory,
             options.forge_commit,
             options.authority_commit,
         )
         rendered = _canonical_json(predicate)
-        _write_create_only(subject_checksums_output, subject_checksums)
-        _write_create_only(predicate_output, rendered)
+        _require_pinned_output_parents_stable(pinned_outputs, pinned_inputs)
+        created_outputs.append(
+            _write_create_only(subject_checksums_output, subject_checksums)
+        )
+        _require_pinned_output_parents_stable(pinned_outputs, pinned_inputs)
+        created_outputs.append(_write_create_only(predicate_output, rendered))
+        _require_pinned_output_parents_stable(pinned_outputs, pinned_inputs)
+        _require_created_outputs_stable(created_outputs)
     except VerificationError as error:
         print(f"release verification failed: {error}", file=sys.stderr)
         return 1
+    finally:
+        for created in created_outputs:
+            try:
+                os.close(created.file_fd)
+            except OSError:
+                pass
+        for output in pinned_outputs:
+            try:
+                os.close(output.directory_fd)
+            except OSError:
+                pass
+        for input_directory in pinned_inputs:
+            _close_pinned_directory(input_directory)
     print(
         json.dumps(
             {

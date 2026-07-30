@@ -124,12 +124,14 @@
     "workflowRef": "https://github.com/jmp0xf/forge-release-authority/.github/workflows/qualify.yml@refs/heads/main"
   },
   "limits": {
-    "binaryBytes": 268435456,
+    "binaryBytes": 67108864,
     "cargoLockBytes": 1048576,
-    "sbomBytes": 33554432,
-    "noticeBytes": 33554432,
-    "manifestBytes": 1048576,
-    "checksumsBytes": 1048576,
-    "builderRecordBytes": 1048576
+    "sbomBytes": 2097152,
+    "noticeBytes": 8388608,
+    "manifestBytes": 65536,
+    "checksumsBytes": 16384,
+    "builderRecordBytes": 65536,
+    "totalAssetBytes": 201326592,
+    "totalBuilderRecordBytes": 262144
   }
 }
