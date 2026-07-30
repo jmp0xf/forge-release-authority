@@ -33,6 +33,15 @@ def _job_blocks(workflow: str) -> dict[str, str]:
     return blocks
 
 
+def _step_block(workflow: str, name: str) -> str:
+    marker = f"      - name: {name}\n"
+    if workflow.count(marker) != 1:
+        raise AssertionError(f"expected exactly one workflow step named {name!r}")
+    start = workflow.index(marker)
+    end = workflow.find("\n      - name:", start + len(marker))
+    return workflow[start:] if end == -1 else workflow[start:end]
+
+
 class QualifyWorkflowTests(unittest.TestCase):
     def test_external_actions_are_the_complete_allowlist_at_full_commits(self) -> None:
         seen: set[str] = set()
@@ -66,7 +75,19 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("overwrite: true", workflow)
         self.assertEqual(workflow.count("overwrite: false"), 6)
-        self.assertEqual(workflow.count("retention-days: 30"), 4)
+        expected_retention = {
+            "Upload fixed native handoff": 30,
+            "Upload exact finalized assets": 30,
+            "Upload exact builder records": 30,
+            "Upload deterministic qualification preview": 30,
+            "Upload qualified release assets": 90,
+            "Upload qualification evidence": 90,
+        }
+        for step_name, days in expected_retention.items():
+            upload = _step_block(workflow, step_name)
+            self.assertIn("uses: actions/upload-artifact@", upload, step_name)
+            self.assertEqual(upload.count(f"retention-days: {days}"), 1, step_name)
+            self.assertEqual(upload.count("overwrite: false"), 1, step_name)
 
         jobs = _job_blocks(workflow)
         self.assertEqual(
