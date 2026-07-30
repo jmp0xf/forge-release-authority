@@ -98,6 +98,12 @@ describe the actual invocation and must not be fabricated or reused.
 `runDetails.byproducts` contains the five target-specific builder records, sorted by name. Each descriptor contains
 only `name` and a SHA-256 digest. They are diagnostic records, not release subjects or external approvals.
 
+While this build type remains inactive, each native workflow job also uploads one target-specific canary runner
+observation. Those temporary artifacts are bootstrap diagnostics outside this v1 build-type schema: they are not
+builder records, `runDetails.byproducts`, subjects, verifier inputs, or protected-attest inputs. A later reviewed
+change must decide which observed stable constraints to freeze or conservatively verify before activation; merely
+uploading the observations does not change this contract or qualify a release.
+
 ## Process
 
 The build type consists of these fail-closed stages:

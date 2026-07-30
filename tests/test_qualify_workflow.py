@@ -74,8 +74,9 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertNotIn("${{ secrets", workflow)
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("overwrite: true", workflow)
-        self.assertEqual(workflow.count("overwrite: false"), 6)
+        self.assertEqual(workflow.count("overwrite: false"), 7)
         expected_retention = {
+            "Upload canary runner observation": 30,
             "Upload fixed native handoff": 30,
             "Upload exact finalized assets": 30,
             "Upload exact builder records": 30,
@@ -145,6 +146,56 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertGreater(len(python_blocks), 0)
         for index, block in enumerate(python_blocks, start=1):
             compile(textwrap.dedent(block), f"qualify.yml Python block {index}", "exec")
+
+    def test_canary_observations_are_native_only_and_outside_provenance(self) -> None:
+        workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
+        jobs = _job_blocks(workflow)
+        native = jobs["native-build"]
+        unix_build = _step_block(workflow, "Check, test, and stage native assets")
+        windows_build = _step_block(
+            workflow, "Check, test, and stage native assets on Windows"
+        )
+        upload = _step_block(workflow, "Upload canary runner observation")
+
+        script = "scripts/write_canary_observation.py"
+        windows_script = r"scripts\write_canary_observation.py"
+        self.assertEqual(workflow.count(script), 1)
+        self.assertEqual(workflow.count(windows_script), 1)
+        self.assertIn(script, unix_build)
+        self.assertIn(windows_script, windows_build)
+        unix_observation = unix_build[unix_build.index(script) :]
+        windows_observation = windows_build[windows_build.index(windows_script) :]
+        for argument in (
+            "--authority-commit",
+            "--binary",
+            "--cargo-home",
+            "--output-dir",
+            "--source-commit",
+            "--target",
+        ):
+            self.assertEqual(unix_observation.count(argument), 1, argument)
+            self.assertEqual(windows_observation.count(argument), 1, argument)
+
+        self.assertIn("name: canary-observation-${{ matrix.target }}", upload)
+        self.assertIn(
+            "path: ${{ github.workspace }}/canary-observation/"
+            "runner-observation-${{ matrix.target }}.json",
+            upload,
+        )
+        self.assertEqual(upload.count("retention-days: 30"), 1)
+        self.assertEqual(upload.count("overwrite: false"), 1)
+        self.assertIn("contents: read", native)
+        self.assertNotIn("id-token:", native)
+        self.assertNotIn("attestations:", native)
+        self.assertNotIn("environment:", native)
+
+        for job_name in ("finalize", "independent-qualify", "protected-attest"):
+            self.assertNotIn("canary-observation", jobs[job_name], job_name)
+            self.assertNotIn("runner-observation", jobs[job_name], job_name)
+            self.assertNotIn(script, jobs[job_name], job_name)
+            self.assertNotIn(windows_script, jobs[job_name], job_name)
+        self.assertEqual(workflow.count("name: canary-observation-"), 1)
+        self.assertEqual(workflow.count("runner-observation-${{ matrix.target }}.json"), 1)
 
 
 if __name__ == "__main__":

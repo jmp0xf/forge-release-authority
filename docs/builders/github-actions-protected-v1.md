@@ -49,6 +49,22 @@ They may read source and upload workflow artifacts. They must not receive an OID
 repository secret, attestation permission, GitHub Release permission, or other publication credential. Each emits one
 binary, one SBOM, and one bounded builder record.
 
+For the inactive canary only, each native job also writes and uploads one create-only, target-specific runner
+observation retained for 30 days. The standard-library-only collector bounds command time and output, file hashing,
+directory scans, manifest entries, and final JSON size. It reads only an explicit runner-environment allowlist, replaces
+known workspace/tool-cache/home path prefixes, redacts secret-like assignments, hashes bounded regular files, and
+records unavailable probes rather than inventing values. It records runner image fields, Rust/Cargo/rustup/Git/Python
+versions and executable summaries, target Rust libraries, fresh Cargo registry archives, and available native
+compiler/linker/SDK/runtime diagnostics.
+
+These observations are produced in the same unprivileged job that executes candidate code and are untrusted bootstrap
+diagnostics. They are kept outside the native binary/SBOM/builder-record handoff, are never downloaded by finalize,
+independent qualification, or protected attest, and do not enter the v1 predicate, byproducts, subjects, attestation,
+or qualified evidence. In particular, the Windows outer workflow shell cannot observe the bounded MSVC environment
+that Forge xtask discovers and projects internally; the Windows record states that limitation and does not reconstruct
+or claim an MSVC environment. A future source-side observation, reviewed constraint, or other independent mechanism is
+required to close that gap.
+
 ### Finalize job
 
 The finalize job may execute the candidate's `release-finalize` and `release-check` commands and assemble workflow

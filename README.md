@@ -21,7 +21,9 @@ qualification, attestation, approval, publication, or withdrawal rules that judg
 The repository is being bootstrapped. The permission-separated `.github/workflows/qualify.yml` is installed for an
 inactive canary, but it must not be treated as release qualification. Before activation, hosted controls must be
 verified and a non-release canary must record and freeze the actual runner inputs and signer-builder identity in a
-follow-up reviewed change. The repository does not yet tag, upload, or publish Forge releases.
+follow-up reviewed change. Each native canary job uploads a separate bounded runner-observation diagnostic for that
+review; these files are not builder records, provenance byproducts, protected-job inputs, approval, or release
+evidence. The repository does not yet tag, upload, or publish Forge releases.
 
 The stable provenance identities are documented by the
 [Forge qualification build type](docs/build-types/qualify-v1.md) and the
