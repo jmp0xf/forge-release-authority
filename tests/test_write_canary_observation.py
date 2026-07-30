@@ -116,6 +116,8 @@ class CanaryObservationTests(unittest.TestCase):
                 "print('Authorization: Bearer visible-bearer'); "
                 "print('GITHUB_TOKEN=visible-github'); "
                 "print('API_KEY=visible-api'); "
+                "print('AWS_SECRET_ACCESS_KEY=visible-aws'); "
+                "print('OAUTH_CLIENT_SECRET=visible-oauth'); "
                 "print('https://runner:visible-password@example.test/path')",
             ],
             environment,
@@ -129,11 +131,15 @@ class CanaryObservationTests(unittest.TestCase):
         self.assertNotIn("visible-bearer", rendered)
         self.assertNotIn("visible-github", rendered)
         self.assertNotIn("visible-api", rendered)
+        self.assertNotIn("visible-aws", rendered)
+        self.assertNotIn("visible-oauth", rendered)
         self.assertNotIn("visible-password", rendered)
         self.assertIn("token=<redacted>", rendered)
         self.assertIn("Authorization: <redacted>", rendered)
         self.assertIn("GITHUB_TOKEN=<redacted>", rendered)
         self.assertIn("API_KEY=<redacted>", rendered)
+        self.assertIn("AWS_SECRET_ACCESS_KEY=<redacted>", rendered)
+        self.assertIn("OAUTH_CLIENT_SECRET=<redacted>", rendered)
         self.assertIn("https://<redacted>@example.test/path", rendered)
 
     def test_command_capture_refuses_search_result_outside_explicit_path(self) -> None:
