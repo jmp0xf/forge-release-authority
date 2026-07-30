@@ -636,6 +636,8 @@ def _require_github_repository(
     remote_owner = _require_object(metadata.get("owner"), "GitHub repository.owner")
     _require_value(remote_owner.get("id"), owner_id, "GitHub repository.owner.id")
     _require_value(remote_owner.get("login"), owner, "GitHub repository.owner.login")
+    _require_value(metadata.get("visibility"), "public", "GitHub repository.visibility")
+    _require_value(metadata.get("private"), False, "GitHub repository.private")
     _require_value(metadata.get("default_branch"), "main", "GitHub default branch")
 
     branch = _require_object(

@@ -885,6 +885,8 @@ class VerifyReleaseTests(unittest.TestCase):
                 "id": repository_id,
                 "name": "forge",
                 "owner": {"id": 2247932, "login": "jmp0xf"},
+                "private": False,
+                "visibility": "public",
             },
             prefix + "/branches/main": {
                 "commit": {"sha": FORGE_COMMIT},
@@ -970,6 +972,9 @@ class VerifyReleaseTests(unittest.TestCase):
                 candidate[prefix]["id"] = 1
             elif name == "owner-id":
                 candidate[prefix]["owner"]["id"] = 1
+            elif name == "private-repository":
+                candidate[prefix]["private"] = True
+                candidate[prefix]["visibility"] = "private"
             elif name == "unprotected-main":
                 candidate[prefix + "/branches/main"]["protected"] = False
             elif name == "non-head-commit":
@@ -1005,6 +1010,7 @@ class VerifyReleaseTests(unittest.TestCase):
         for mutation in (
             "repository-id",
             "owner-id",
+            "private-repository",
             "unprotected-main",
             "non-head-commit",
             "commit-sha",
