@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -110,7 +111,12 @@ class CanaryObservationTests(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                f"print({workspace!r} + '/tool'); print('token=visible-value')",
+                f"print({workspace!r} + '/tool'); "
+                "print('token=visible-value'); "
+                "print('Authorization: Bearer visible-bearer'); "
+                "print('GITHUB_TOKEN=visible-github'); "
+                "print('API_KEY=visible-api'); "
+                "print('https://runner:visible-password@example.test/path')",
             ],
             environment,
             replacements,
@@ -120,7 +126,46 @@ class CanaryObservationTests(unittest.TestCase):
         self.assertIn("$GITHUB_WORKSPACE/tool", rendered)
         self.assertNotIn(workspace, rendered)
         self.assertNotIn("visible-value", rendered)
+        self.assertNotIn("visible-bearer", rendered)
+        self.assertNotIn("visible-github", rendered)
+        self.assertNotIn("visible-api", rendered)
+        self.assertNotIn("visible-password", rendered)
         self.assertIn("token=<redacted>", rendered)
+        self.assertIn("Authorization: <redacted>", rendered)
+        self.assertIn("GITHUB_TOKEN=<redacted>", rendered)
+        self.assertIn("API_KEY=<redacted>", rendered)
+        self.assertIn("https://<redacted>@example.test/path", rendered)
+
+    def test_command_capture_refuses_search_result_outside_explicit_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout_tool = Path(temporary) / "cargo.exe"
+            checkout_tool.write_bytes(b"not an executable")
+            environment = {
+                "GITHUB_WORKSPACE": temporary,
+                "PATH": os.pathsep.join((os.fspath(Path(temporary) / "safe"),)),
+            }
+            with mock.patch.object(shutil, "which", return_value=os.fspath(checkout_tool)):
+                command = observations._run_command(
+                    ["cargo.exe", "-V"],
+                    environment,
+                    observations._path_replacements(environment),
+                )
+        self.assertEqual(command["status"], "refused-unsafe-search-result")
+
+    def test_command_capture_marks_retained_prefix_as_truncated(self) -> None:
+        with (
+            mock.patch.object(observations, "MAX_COMMAND_STREAM_BYTES", 4096),
+            mock.patch.object(observations, "MAX_RETAINED_STREAM_BYTES", 128),
+        ):
+            command = observations._run_command(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 512)"],
+                {},
+                [],
+            )
+        self.assertEqual(command["status"], "ok")
+        self.assertEqual(command["stdout_total_bytes"], 512)
+        self.assertEqual(len(command["stdout"]), 128)
+        self.assertTrue(command["stdout_truncated"])
 
     def test_command_capture_kills_output_above_hard_limit(self) -> None:
         with (
@@ -172,6 +217,19 @@ class CanaryObservationTests(unittest.TestCase):
             (cache / "linked.crate").unlink()
             (cache / "one.crate").write_bytes(b"one")
             (cache / "two.crate").write_bytes(b"two")
+            with (
+                mock.patch.object(observations, "MAX_MANIFEST_ENTRIES", 10),
+                mock.patch.object(observations, "MAX_SCAN_ENTRIES", 1),
+                self.assertRaisesRegex(observations.ObservationError, "scan entry limit"),
+            ):
+                observations._directory_manifest(
+                    cache,
+                    observations.HashBudget(),
+                    suffix=".crate",
+                    per_file_limit=1024,
+                    label="cache",
+                )
+
             with (
                 mock.patch.object(observations, "MAX_MANIFEST_ENTRIES", 1),
                 self.assertRaisesRegex(observations.ObservationError, "manifest entry limit"),
