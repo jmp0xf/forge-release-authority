@@ -12,6 +12,8 @@ scope.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -23,6 +25,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 POLICY_SCHEMA = "forge.release-authority-policy/v1"
@@ -30,13 +34,84 @@ BUILDER_RECORD_SCHEMA = "forge.release-authority-builder-record/v1"
 MANIFEST_SCHEMA = "forge.release-manifest/v2"
 SBOM_GRAPH_SCHEMA = "forge.release-sbom-graph/v1"
 SLSA_PROVENANCE_V1 = "https://slsa.dev/provenance/v1"
+SOURCE_OWNER = "jmp0xf"
+SOURCE_OWNER_ID = 2247932
+SOURCE_REPOSITORY = "forge"
+SOURCE_REPOSITORY_ID = 1312750430
+AUTHORITY_OWNER = "jmp0xf"
+AUTHORITY_OWNER_ID = 2247932
+AUTHORITY_REPOSITORY = "forge-release-authority"
+AUTHORITY_REPOSITORY_ID = 1317240187
+AUTHORITY_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+AUTHORITY_OIDC_SUBJECT_PREFIX = "repo:jmp0xf@2247932/forge-release-authority@1317240187"
+AUTHORITY_ENVIRONMENT = "forge-release"
+TARGET_CONTRACTS = {
+    "x86_64-unknown-linux-musl": {
+        "runnerLabel": "ubuntu-24.04",
+        "binaryFormat": "elf64-x86_64-static",
+        "binary": "forge-0.1.0-rc.2-x86_64-unknown-linux-musl",
+        "sbom": "forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json",
+        "builderRecord": "builder-record-x86_64-unknown-linux-musl.json",
+    },
+    "aarch64-unknown-linux-musl": {
+        "runnerLabel": "ubuntu-24.04-arm",
+        "binaryFormat": "elf64-aarch64-static",
+        "binary": "forge-0.1.0-rc.2-aarch64-unknown-linux-musl",
+        "sbom": "forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json",
+        "builderRecord": "builder-record-aarch64-unknown-linux-musl.json",
+    },
+    "x86_64-apple-darwin": {
+        "runnerLabel": "macos-15-intel",
+        "binaryFormat": "macho64-x86_64",
+        "binary": "forge-0.1.0-rc.2-x86_64-apple-darwin",
+        "sbom": "forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json",
+        "builderRecord": "builder-record-x86_64-apple-darwin.json",
+    },
+    "aarch64-apple-darwin": {
+        "runnerLabel": "macos-15",
+        "binaryFormat": "macho64-aarch64",
+        "binary": "forge-0.1.0-rc.2-aarch64-apple-darwin",
+        "sbom": "forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json",
+        "builderRecord": "builder-record-aarch64-apple-darwin.json",
+    },
+    "x86_64-pc-windows-msvc": {
+        "runnerLabel": "windows-2025",
+        "binaryFormat": "pe64-x86_64",
+        "binary": "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe",
+        "sbom": "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json",
+        "builderRecord": "builder-record-x86_64-pc-windows-msvc.json",
+    },
+}
+AUTHORITY_WORKFLOW_REF = (
+    "jmp0xf/forge-release-authority/.github/workflows/qualify.yml@refs/heads/main"
+)
+GITHUB_API_ROOT = "https://api.github.com"
+GITHUB_API_VERSION = "2022-11-28"
+GITHUB_API_TOKEN_ENV = "FORGE_AUTHORITY_GITHUB_TOKEN"
+GITHUB_API_TIMEOUT_SECONDS = 30
+AUTHORITY_VERIFIER_PATH = Path(__file__).resolve()
+AUTHORITY_POLICY_PATH = (
+    AUTHORITY_VERIFIER_PATH.parents[1] / "contracts" / "release-policy.json"
+)
+BUILD_TYPE_URI = (
+    "https://github.com/jmp0xf/forge-release-authority/"
+    "blob/main/docs/build-types/qualify-v1.md"
+)
+BUILDER_ID_URI = (
+    "https://github.com/jmp0xf/forge-release-authority/"
+    "blob/main/docs/builders/github-actions-protected-v1.md"
+)
 MANIFEST_NAME = "release-manifest.json"
 CHECKSUMS_NAME = "SHA256SUMS"
+NOTICE_NAME = "THIRD-PARTY-LICENSES.txt"
 LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 LOWER_GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 SPDX_EXPRESSION = re.compile(r"[A-Za-z0-9.+() -]+\Z")
 MAX_AUTHORITY_POLICY_BYTES = 1024 * 1024
+MAX_AUTHORITY_VERIFIER_BYTES = 4 * 1024 * 1024
+MAX_GITHUB_METADATA_BYTES = 4 * 1024 * 1024
+MAX_GITHUB_TREE_ENTRIES = 4096
 MAX_SBOM_COMPONENTS = 512
 MAX_SBOM_DEPENDENCY_EDGES = 4_096
 MAX_ELF_PROGRAM_HEADERS = 128
@@ -87,6 +162,31 @@ class _CreatedOutput:
     identity: StatIdentity
     expected_length: int
     expected_sha256: str
+
+
+@dataclass(frozen=True)
+class _ResolvedMaterials:
+    """Bytes resolved by the authority from immutable GitHub repository identities."""
+
+    cargo_lock: bytes
+    source_license_notices: bytes
+    authority_policy: bytes
+    authority_verifier: bytes
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    """Never send an authority request, including its token, through a redirect."""
+
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        return None
 
 
 def _require_secure_posix_fs_capabilities() -> None:
@@ -448,6 +548,326 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _github_api_get(path: str, limit: int, label: str) -> Any:
+    """Read one bounded JSON response from the fixed GitHub API origin."""
+    if not path.startswith("/repositories/") or "\r" in path or "\n" in path:
+        raise VerificationError(f"invalid GitHub API path for {label}")
+    if limit <= 0:
+        raise VerificationError(f"invalid GitHub API response limit for {label}")
+    token = os.environ.get(GITHUB_API_TOKEN_ENV)
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "forge-release-authority/v1",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+    if token is not None:
+        if (
+            not token
+            or len(token) > 4096
+            or not token.isascii()
+            or "\r" in token
+            or "\n" in token
+        ):
+            raise VerificationError(
+                f"{GITHUB_API_TOKEN_ENV} is not a bounded ASCII token"
+            )
+        headers["Authorization"] = f"Bearer {token}"
+    url = GITHUB_API_ROOT + path
+    request = Request(url, headers=headers, method="GET")
+    try:
+        with build_opener(_RejectRedirects()).open(
+            request, timeout=GITHUB_API_TIMEOUT_SECONDS
+        ) as response:
+            if response.getcode() != 200 or response.geturl() != url:
+                raise VerificationError(
+                    f"GitHub API returned an unexpected response for {label}"
+                )
+            content_type = response.headers.get_content_type()
+            if content_type != "application/json":
+                raise VerificationError(
+                    f"GitHub API returned non-JSON content for {label}"
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                if (
+                    len(content_length) > 20
+                    or DECIMAL.fullmatch(content_length) is None
+                    or int(content_length) > limit
+                ):
+                    raise VerificationError(
+                        f"GitHub API response for {label} exceeds {limit} bytes"
+                    )
+            data = response.read(limit + 1)
+    except VerificationError:
+        raise
+    except HTTPError as error:
+        raise VerificationError(
+            f"GitHub API request for {label} failed with HTTP {error.code}"
+        ) from error
+    except (OSError, TimeoutError, URLError) as error:
+        raise VerificationError(f"GitHub API request for {label} failed") from error
+    if len(data) > limit:
+        raise VerificationError(
+            f"GitHub API response for {label} exceeds {limit} bytes"
+        )
+    return _load_json_bytes(data, f"GitHub API {label}")
+
+
+def _require_github_repository(
+    identity: Mapping[str, Any], api_get: Callable[[str, int, str], Any]
+) -> str:
+    """Resolve and validate one immutable repository identity and protected main."""
+    repository_id = _require_integer(identity["repositoryId"], "repository ID")
+    owner_id = _require_integer(identity["ownerId"], "repository owner ID")
+    owner = _require_string(identity["owner"], "repository owner")
+    repository = _require_string(identity["repository"], "repository name")
+    prefix = f"/repositories/{repository_id}"
+    metadata = _require_object(
+        api_get(prefix, MAX_GITHUB_METADATA_BYTES, f"repository {repository_id}"),
+        f"GitHub repository {repository_id}",
+    )
+    _require_value(metadata.get("id"), repository_id, "GitHub repository.id")
+    _require_value(metadata.get("name"), repository, "GitHub repository.name")
+    _require_value(
+        metadata.get("full_name"),
+        f"{owner}/{repository}",
+        "GitHub repository.full_name",
+    )
+    remote_owner = _require_object(metadata.get("owner"), "GitHub repository.owner")
+    _require_value(remote_owner.get("id"), owner_id, "GitHub repository.owner.id")
+    _require_value(remote_owner.get("login"), owner, "GitHub repository.owner.login")
+    _require_value(metadata.get("default_branch"), "main", "GitHub default branch")
+
+    branch = _require_object(
+        api_get(
+            prefix + "/branches/main",
+            MAX_GITHUB_METADATA_BYTES,
+            f"repository {repository_id} protected main",
+        ),
+        "GitHub main branch",
+    )
+    _require_value(branch.get("name"), "main", "GitHub branch.name")
+    _require_value(branch.get("protected"), True, "GitHub branch.protected")
+    branch_commit = _require_object(branch.get("commit"), "GitHub branch.commit")
+    return _require_git_sha(
+        _require_string(branch_commit.get("sha"), "GitHub branch.commit.sha"),
+        "GitHub branch.commit.sha",
+    )
+
+
+def _git_blob_sha(data: bytes) -> str:
+    """Reproduce the SHA-1 object identity used by this 40-hex Git repository."""
+    header = f"blob {len(data)}\0".encode("ascii")
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def _resolve_repository_files(
+    identity: Mapping[str, Any],
+    commit: str,
+    paths: Mapping[str, int],
+    api_get: Callable[[str, int, str], Any] = _github_api_get,
+) -> dict[str, bytes]:
+    """Resolve regular blobs through repository -> commit -> tree -> blob APIs."""
+    commit = _require_git_sha(commit, "repository commit")
+    repository_id = _require_integer(identity["repositoryId"], "repository ID")
+    main_commit = _require_github_repository(identity, api_get)
+    if commit != main_commit:
+        raise VerificationError(
+            f"repository {repository_id} commit is not the protected main HEAD"
+        )
+    prefix = f"/repositories/{repository_id}"
+    commit_document = _require_object(
+        api_get(
+            f"{prefix}/git/commits/{commit}",
+            MAX_GITHUB_METADATA_BYTES,
+            f"repository {repository_id} commit",
+        ),
+        "GitHub Git commit",
+    )
+    _require_value(commit_document.get("sha"), commit, "GitHub Git commit.sha")
+    root_tree = _require_object(commit_document.get("tree"), "GitHub Git commit.tree")
+    root_tree_sha = _require_git_sha(
+        _require_string(root_tree.get("sha"), "GitHub Git commit.tree.sha"),
+        "GitHub Git commit.tree.sha",
+    )
+
+    tree_cache: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def tree_entries(tree_sha: str) -> dict[str, dict[str, Any]]:
+        cached = tree_cache.get(tree_sha)
+        if cached is not None:
+            return cached
+        document = _require_object(
+            api_get(
+                f"{prefix}/git/trees/{tree_sha}",
+                MAX_GITHUB_METADATA_BYTES,
+                f"repository {repository_id} tree {tree_sha}",
+            ),
+            "GitHub Git tree",
+        )
+        _require_value(document.get("sha"), tree_sha, "GitHub Git tree.sha")
+        _require_value(document.get("truncated"), False, "GitHub Git tree.truncated")
+        raw_entries = _require_list(document.get("tree"), "GitHub Git tree.tree")
+        if len(raw_entries) > MAX_GITHUB_TREE_ENTRIES:
+            raise VerificationError(
+                f"GitHub Git tree exceeds {MAX_GITHUB_TREE_ENTRIES} entries"
+            )
+        entries: dict[str, dict[str, Any]] = {}
+        for index, raw_entry in enumerate(raw_entries):
+            entry = _require_object(raw_entry, f"GitHub Git tree.tree[{index}]")
+            path = _require_string(
+                entry.get("path"), f"GitHub Git tree.tree[{index}].path"
+            )
+            if path in entries:
+                raise VerificationError(f"GitHub Git tree repeats path {path!r}")
+            entries[path] = entry
+        tree_cache[tree_sha] = entries
+        return entries
+
+    resolved: dict[str, bytes] = {}
+    for path, limit in paths.items():
+        components = path.split("/")
+        if (
+            not components
+            or any(component in {"", ".", ".."} for component in components)
+            or any("\\" in component or "\x00" in component for component in components)
+        ):
+            raise VerificationError(f"invalid trusted repository path {path!r}")
+        tree_sha = root_tree_sha
+        final_entry: dict[str, Any] | None = None
+        for index, component in enumerate(components):
+            entry = tree_entries(tree_sha).get(component)
+            if entry is None:
+                raise VerificationError(f"trusted repository path {path!r} is absent")
+            is_final = index == len(components) - 1
+            if is_final:
+                final_entry = entry
+                break
+            _require_value(
+                entry.get("type"), "tree", f"trusted repository path {path!r} type"
+            )
+            _require_value(
+                entry.get("mode"), "040000", f"trusted repository path {path!r} mode"
+            )
+            tree_sha = _require_git_sha(
+                _require_string(
+                    entry.get("sha"), f"trusted repository path {path!r} tree SHA"
+                ),
+                f"trusted repository path {path!r} tree SHA",
+            )
+        if final_entry is None:
+            raise VerificationError(f"trusted repository path {path!r} is absent")
+        _require_value(
+            final_entry.get("type"), "blob", f"trusted repository path {path!r} type"
+        )
+        _require_value(
+            final_entry.get("mode"), "100644", f"trusted repository path {path!r} mode"
+        )
+        blob_sha = _require_git_sha(
+            _require_string(
+                final_entry.get("sha"), f"trusted repository path {path!r} blob SHA"
+            ),
+            f"trusted repository path {path!r} blob SHA",
+        )
+        blob_document = _require_object(
+            api_get(
+                f"{prefix}/git/blobs/{blob_sha}",
+                max(MAX_GITHUB_METADATA_BYTES, 2 * limit + 65536),
+                f"repository {repository_id} blob {path}",
+            ),
+            "GitHub Git blob",
+        )
+        _require_value(blob_document.get("sha"), blob_sha, "GitHub Git blob.sha")
+        _require_value(
+            blob_document.get("encoding"), "base64", "GitHub Git blob.encoding"
+        )
+        size = _require_integer(blob_document.get("size"), "GitHub Git blob.size")
+        if size < 0 or size > limit:
+            raise VerificationError(
+                f"trusted repository path {path!r} exceeds {limit} bytes"
+            )
+        encoded = _require_string(
+            blob_document.get("content"), "GitHub Git blob.content"
+        )
+        try:
+            data = base64.b64decode("".join(encoded.splitlines()), validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise VerificationError(
+                f"trusted repository path {path!r} has invalid base64"
+            ) from error
+        if len(data) != size:
+            raise VerificationError(
+                f"trusted repository path {path!r} size is inconsistent"
+            )
+        if _git_blob_sha(data) != blob_sha:
+            raise VerificationError(
+                f"trusted repository path {path!r} blob SHA is inconsistent"
+            )
+        resolved[path] = data
+    return resolved
+
+
+def _resolve_github_materials(
+    policy: Mapping[str, Any], forge_commit: str, authority_commit: str
+) -> _ResolvedMaterials:
+    """Resolve every source/authority byte that the predicate attributes to Git."""
+    source = _resolve_repository_files(
+        policy["source"],
+        forge_commit,
+        {
+            "Cargo.lock": policy["limits"]["cargoLockBytes"],
+            "THIRD-PARTY-LICENSES.txt": policy["limits"]["noticeBytes"],
+        },
+    )
+    authority = _resolve_repository_files(
+        policy["authority"],
+        authority_commit,
+        {
+            "contracts/release-policy.json": MAX_AUTHORITY_POLICY_BYTES,
+            "scripts/verify_release.py": MAX_AUTHORITY_VERIFIER_BYTES,
+        },
+    )
+    return _ResolvedMaterials(
+        cargo_lock=source["Cargo.lock"],
+        source_license_notices=source["THIRD-PARTY-LICENSES.txt"],
+        authority_policy=authority["contracts/release-policy.json"],
+        authority_verifier=authority["scripts/verify_release.py"],
+    )
+
+
+def _authority_commit_from_actions_environment(
+    environment: Mapping[str, str],
+) -> str:
+    """Derive the authority commit only from a protected main workflow context."""
+    expected = {
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_REF_NAME": "main",
+        "GITHUB_REF_PROTECTED": "true",
+        "GITHUB_REF_TYPE": "branch",
+        "GITHUB_REPOSITORY": f"{AUTHORITY_OWNER}/{AUTHORITY_REPOSITORY}",
+        "GITHUB_REPOSITORY_ID": str(AUTHORITY_REPOSITORY_ID),
+        "GITHUB_REPOSITORY_OWNER": AUTHORITY_OWNER,
+        "GITHUB_REPOSITORY_OWNER_ID": str(AUTHORITY_OWNER_ID),
+        "GITHUB_WORKFLOW_REF": AUTHORITY_WORKFLOW_REF,
+    }
+    for name, value in expected.items():
+        _require_value(environment.get(name), value, f"Actions context {name}")
+    authority_commit = _require_git_sha(
+        environment.get("GITHUB_SHA", ""), "Actions context GITHUB_SHA"
+    )
+    workflow_commit = _require_git_sha(
+        environment.get("GITHUB_WORKFLOW_SHA", ""),
+        "Actions context GITHUB_WORKFLOW_SHA",
+    )
+    if authority_commit != workflow_commit:
+        raise VerificationError(
+            "Actions workflow commit differs from the protected authority commit"
+        )
+    return authority_commit
+
+
 def _read_bounded_regular_path(path: Path, limit: int, label: str) -> bytes:
     name = _require_safe_basename(path.name, f"{label} name")
     parent = _pin_directory(path.parent, f"{label} parent directory")
@@ -499,6 +919,13 @@ def _validate_policy(policy: dict[str, Any]) -> None:
     for key in ("ownerId", "repositoryId"):
         if _require_integer(source[key], f"policy.source.{key}") <= 0:
             raise VerificationError(f"policy.source.{key} must be positive")
+    for key, expected in {
+        "owner": SOURCE_OWNER,
+        "ownerId": SOURCE_OWNER_ID,
+        "repository": SOURCE_REPOSITORY,
+        "repositoryId": SOURCE_REPOSITORY_ID,
+    }.items():
+        _require_value(source[key], expected, f"policy.source.{key}")
 
     authority = _require_object(policy["authority"], "policy.authority")
     _require_keys(
@@ -526,14 +953,16 @@ def _validate_policy(policy: dict[str, Any]) -> None:
     for key in ("ownerId", "repositoryId"):
         if _require_integer(authority[key], f"policy.authority.{key}") <= 0:
             raise VerificationError(f"policy.authority.{key} must be positive")
-    _require_value(
-        authority["oidcSubjectPrefix"],
-        (
-            f"repo:{authority['owner']}@{authority['ownerId']}/"
-            f"{authority['repository']}@{authority['repositoryId']}"
-        ),
-        "policy.authority.oidcSubjectPrefix",
-    )
+    for key, expected in {
+        "owner": AUTHORITY_OWNER,
+        "ownerId": AUTHORITY_OWNER_ID,
+        "repository": AUTHORITY_REPOSITORY,
+        "repositoryId": AUTHORITY_REPOSITORY_ID,
+        "oidcIssuer": AUTHORITY_OIDC_ISSUER,
+        "oidcSubjectPrefix": AUTHORITY_OIDC_SUBJECT_PREFIX,
+        "environment": AUTHORITY_ENVIRONMENT,
+    }.items():
+        _require_value(authority[key], expected, f"policy.authority.{key}")
 
     release = _require_object(policy["release"], "policy.release")
     _require_keys(
@@ -568,6 +997,7 @@ def _validate_policy(policy: dict[str, Any]) -> None:
     notice = _require_object(release["notice"], "policy.release.notice")
     _require_keys(notice, {"name", "target"}, "policy.release.notice")
     notice_name = _require_safe_basename(notice["name"], "policy.release.notice.name")
+    _require_value(notice_name, NOTICE_NAME, "policy.release.notice.name")
     _require_value(notice["target"], "all", "policy.release.notice.target")
 
     toolchain = _require_object(policy["toolchain"], "policy.toolchain")
@@ -604,20 +1034,23 @@ def _validate_policy(policy: dict[str, Any]) -> None:
             },
             path,
         )
-        target_names.append(_require_string(target["triple"], f"{path}.triple"))
-        if not _require_string(target["runnerLabel"], f"{path}.runnerLabel"):
-            raise VerificationError(f"{path}.runnerLabel must not be empty")
+        triple = _require_string(target["triple"], f"{path}.triple")
+        target_names.append(triple)
+        expected_target = TARGET_CONTRACTS.get(triple)
+        if expected_target is None:
+            raise VerificationError(f"{path}.triple is not a frozen v1 target")
+        runner_label = _require_string(target["runnerLabel"], f"{path}.runnerLabel")
+        _require_value(
+            runner_label, expected_target["runnerLabel"], f"{path}.runnerLabel"
+        )
         binary_format = _require_string(target["binaryFormat"], f"{path}.binaryFormat")
-        if binary_format not in {
-            "elf64-x86_64-static",
-            "elf64-aarch64-static",
-            "macho64-x86_64",
-            "macho64-aarch64",
-            "pe64-x86_64",
-        }:
-            raise VerificationError(f"{path}.binaryFormat is unsupported")
+        _require_value(
+            binary_format, expected_target["binaryFormat"], f"{path}.binaryFormat"
+        )
         binary = _require_safe_basename(target["binary"], f"{path}.binary")
+        _require_value(binary, expected_target["binary"], f"{path}.binary")
         sbom = _require_safe_basename(target["sbom"], f"{path}.sbom")
+        _require_value(sbom, expected_target["sbom"], f"{path}.sbom")
         if sbom != f"{binary}.cdx.json":
             raise VerificationError(
                 f"{path}.sbom must be the binary basename plus .cdx.json"
@@ -651,10 +1084,16 @@ def _validate_policy(policy: dict[str, Any]) -> None:
         )
         binaries.append(binary)
         sboms.append(sbom)
-        records.append(
-            _require_safe_basename(target["builderRecord"], f"{path}.builderRecord")
+        builder_record = _require_safe_basename(
+            target["builderRecord"], f"{path}.builderRecord"
         )
+        _require_value(
+            builder_record, expected_target["builderRecord"], f"{path}.builderRecord"
+        )
+        records.append(builder_record)
     _require_unique_casefold(target_names, "policy target triples")
+    if set(target_names) != set(TARGET_CONTRACTS):
+        raise VerificationError("policy targets must be the frozen v1 target set")
     _require_unique_casefold(binaries + sboms, "policy target assets")
     _require_unique_casefold(records, "policy builder records")
 
@@ -681,17 +1120,19 @@ def _validate_policy(policy: dict[str, Any]) -> None:
 
     provenance = _require_object(policy["provenance"], "policy.provenance")
     _require_keys(
-        provenance, {"predicateType", "buildType", "workflowRef"}, "policy.provenance"
+        provenance, {"predicateType", "buildType", "builderId"}, "policy.provenance"
     )
     _require_value(
         provenance["predicateType"],
         SLSA_PROVENANCE_V1,
         "policy.provenance.predicateType",
     )
-    for key in ("buildType", "workflowRef"):
-        uri = _require_string(provenance[key], f"policy.provenance.{key}")
-        if not uri.startswith("https://"):
-            raise VerificationError(f"policy.provenance.{key} must be an HTTPS URI")
+    _require_value(
+        provenance["buildType"], BUILD_TYPE_URI, "policy.provenance.buildType"
+    )
+    _require_value(
+        provenance["builderId"], BUILDER_ID_URI, "policy.provenance.builderId"
+    )
 
     limits = _require_object(policy["limits"], "policy.limits")
     expected_limits = {
@@ -1889,7 +2330,6 @@ def build_predicate(
     policy_digest: str,
     cargo_lock: bytes,
     source_license_notices: bytes,
-    assets: Mapping[str, bytes],
     records: Mapping[str, bytes],
     forge_commit: str,
     authority_commit: str,
@@ -1903,17 +2343,7 @@ def build_predicate(
     return {
         "buildDefinition": {
             "buildType": policy["provenance"]["buildType"],
-            "externalParameters": {
-                "cargoLock": {
-                    "digest": {"sha256": _sha256(cargo_lock)},
-                    "length": len(cargo_lock),
-                },
-                "licenseNotices": {
-                    "digest": {"sha256": _sha256(source_license_notices)},
-                    "length": len(source_license_notices),
-                },
-                "sourceCommit": forge_commit,
-            },
+            "externalParameters": {"sourceCommit": forge_commit},
             "internalParameters": {
                 "authority": {
                     "environment": authority["environment"],
@@ -1926,14 +2356,6 @@ def build_predicate(
                 "policySha256": policy_digest,
                 "release": {
                     "subjectNames": policy["release"]["assets"],
-                    "subjects": [
-                        {
-                            "digest": {"sha256": _sha256(assets[name])},
-                            "length": len(assets[name]),
-                            "name": name,
-                        }
-                        for name in policy["release"]["assets"]
-                    ],
                     "tag": policy["release"]["tag"],
                     "targets": [target["triple"] for target in policy["targets"]],
                     "version": policy["release"]["version"],
@@ -1954,13 +2376,28 @@ def build_predicate(
                     ),
                     "digest": {"gitCommit": authority_commit},
                 },
+                {
+                    "name": "Cargo.lock",
+                    "uri": (
+                        f"https://github.com/{source['owner']}/{source['repository']}"
+                        f"/blob/{forge_commit}/Cargo.lock"
+                    ),
+                    "digest": {"sha256": _sha256(cargo_lock)},
+                },
+                {
+                    "name": "THIRD-PARTY-LICENSES.txt",
+                    "uri": (
+                        f"https://github.com/{source['owner']}/{source['repository']}"
+                        f"/blob/{forge_commit}/THIRD-PARTY-LICENSES.txt"
+                    ),
+                    "digest": {"sha256": _sha256(source_license_notices)},
+                },
             ],
         },
         "runDetails": {
-            "builder": {"id": policy["provenance"]["workflowRef"]},
-            # Invocation timestamps and IDs belong to the eventual attestation envelope.  Omitting
-            # them here keeps this predicate deterministic without falsely reusing one invocation
-            # ID across qualification retries for the same two commits.
+            "builder": {"id": policy["provenance"]["builderId"]},
+            # SLSA permits invocation timestamps and IDs here. Omitting them keeps this predicate
+            # deterministic without reusing one invocation ID across qualification retries.
             "metadata": {},
             "byproducts": byproducts,
         },
@@ -1977,26 +2414,38 @@ def _render_subject_checksums(
 
 def _verify_release_with_pinned_directories(
     policy_path: Path,
-    cargo_lock_path: Path,
-    source_license_notices_path: Path,
     assets_directory: _PinnedDirectory,
     builder_records_directory: _PinnedDirectory,
     forge_commit: str,
     authority_commit: str,
+    resolved_materials: _ResolvedMaterials,
 ) -> tuple[dict[str, Any], bytes]:
     """Verify every qualification gate and derive predicate plus subject hashes."""
     forge_commit = _require_git_sha(forge_commit, "forge commit")
     authority_commit = _require_git_sha(authority_commit, "authority commit")
     policy, policy_digest = load_policy(policy_path)
-    cargo_lock = _read_bounded_regular_path(
-        cargo_lock_path, policy["limits"]["cargoLockBytes"], "trusted Cargo.lock"
+    if _sha256(resolved_materials.authority_policy) != policy_digest:
+        raise VerificationError(
+            "authority policy differs from the protected authority commit"
+        )
+    local_verifier = _read_bounded_regular_path(
+        AUTHORITY_VERIFIER_PATH,
+        MAX_AUTHORITY_VERIFIER_BYTES,
+        "authority verifier",
     )
+    if resolved_materials.authority_verifier != local_verifier:
+        raise VerificationError(
+            "authority verifier differs from the protected authority commit"
+        )
+    cargo_lock = resolved_materials.cargo_lock
+    if len(cargo_lock) > policy["limits"]["cargoLockBytes"]:
+        raise VerificationError("trusted Cargo.lock exceeds the policy limit")
     lock_packages = _parse_trusted_cargo_lock(cargo_lock)
-    source_license_notices = _read_bounded_regular_path(
-        source_license_notices_path,
-        policy["limits"]["noticeBytes"],
-        "trusted source license notices",
-    )
+    source_license_notices = resolved_materials.source_license_notices
+    if len(source_license_notices) > policy["limits"]["noticeBytes"]:
+        raise VerificationError(
+            "trusted source license notices exceed the policy limit"
+        )
     _, target_by_asset = _target_maps(policy)
     assets = _read_exact_pinned_directory(
         assets_directory,
@@ -2049,7 +2498,6 @@ def _verify_release_with_pinned_directories(
             policy_digest,
             cargo_lock,
             source_license_notices,
-            assets,
             records,
             forge_commit,
             authority_commit,
@@ -2060,12 +2508,11 @@ def _verify_release_with_pinned_directories(
 
 def _verify_release_with_subjects(
     policy_path: Path,
-    cargo_lock_path: Path,
-    source_license_notices_path: Path,
     assets_directory: Path,
     builder_records_directory: Path,
     forge_commit: str,
     authority_commit: str,
+    resolved_materials: _ResolvedMaterials,
 ) -> tuple[dict[str, Any], bytes]:
     """Verify through directory inodes pinned for the complete read operation."""
     assets = _pin_directory(assets_directory, "release assets directory")
@@ -2074,12 +2521,11 @@ def _verify_release_with_subjects(
         try:
             return _verify_release_with_pinned_directories(
                 policy_path,
-                cargo_lock_path,
-                source_license_notices_path,
                 assets,
                 records,
                 forge_commit,
                 authority_commit,
+                resolved_materials,
             )
         finally:
             _close_pinned_directory(records)
@@ -2089,22 +2535,23 @@ def _verify_release_with_subjects(
 
 def verify_release(
     policy_path: Path,
-    cargo_lock_path: Path,
-    source_license_notices_path: Path,
     assets_directory: Path,
     builder_records_directory: Path,
     forge_commit: str,
     authority_commit: str,
 ) -> dict[str, Any]:
     """Verify every qualification gate without publishing any external state."""
+    policy, _policy_digest = load_policy(policy_path)
+    resolved_materials = _resolve_github_materials(
+        policy, forge_commit, authority_commit
+    )
     predicate, _subject_checksums = _verify_release_with_subjects(
         policy_path,
-        cargo_lock_path,
-        source_license_notices_path,
         assets_directory,
         builder_records_directory,
         forge_commit,
         authority_commit,
+        resolved_materials,
     )
     return predicate
 
@@ -2317,19 +2764,9 @@ def _require_created_outputs_stable(outputs: Sequence[_CreatedOutput]) -> None:
 
 def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--policy",
-        type=Path,
-        default=Path(__file__).resolve().parents[1]
-        / "contracts"
-        / "release-policy.json",
-    )
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--builder-records", type=Path, required=True)
-    parser.add_argument("--cargo-lock", type=Path, required=True)
-    parser.add_argument("--source-license-notices", type=Path, required=True)
     parser.add_argument("--forge-commit", required=True)
-    parser.add_argument("--authority-commit", required=True)
     parser.add_argument("--predicate-out", type=Path, required=True)
     parser.add_argument("--subject-checksums-out", type=Path, required=True)
     return parser.parse_args(arguments)
@@ -2342,6 +2779,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     created_outputs: list[_CreatedOutput] = []
     try:
         _require_secure_posix_fs_capabilities()
+        authority_commit = _authority_commit_from_actions_environment(os.environ)
+        policy_path = AUTHORITY_POLICY_PATH
+        policy, _policy_digest = load_policy(policy_path)
+        resolved_materials = _resolve_github_materials(
+            policy, options.forge_commit, authority_commit
+        )
         assets_directory = _pin_directory(options.assets, "release assets directory")
         pinned_inputs.append(assets_directory)
         builder_records_directory = _pin_directory(
@@ -2365,13 +2808,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         _require_outputs_absent(pinned_outputs)
         _require_fresh_private_output_directories(pinned_outputs)
         predicate, subject_checksums = _verify_release_with_pinned_directories(
-            options.policy,
-            options.cargo_lock,
-            options.source_license_notices,
+            policy_path,
             assets_directory,
             builder_records_directory,
             options.forge_commit,
-            options.authority_commit,
+            authority_commit,
+            resolved_materials,
         )
         rendered = _canonical_json(predicate)
         _require_pinned_output_parents_stable(pinned_outputs, pinned_inputs)
@@ -2401,7 +2843,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                "authorityCommit": options.authority_commit,
+                "authorityCommit": authority_commit,
                 "forgeCommit": options.forge_commit,
                 "predicate": str(options.predicate_out),
                 "subjectChecksums": str(options.subject_checksums_out),

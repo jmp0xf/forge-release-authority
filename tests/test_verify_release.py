@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import inspect
 import io
@@ -8,9 +9,9 @@ import os
 import struct
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from unittest import mock
 
 from scripts import verify_release as verifier
@@ -20,6 +21,21 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "contracts" / "release-policy.json"
 FORGE_COMMIT = "a" * 40
 AUTHORITY_COMMIT = "b" * 40
+ACTIONS_ENVIRONMENT = {
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_EVENT_NAME": "workflow_dispatch",
+    "GITHUB_REF": "refs/heads/main",
+    "GITHUB_REF_NAME": "main",
+    "GITHUB_REF_PROTECTED": "true",
+    "GITHUB_REF_TYPE": "branch",
+    "GITHUB_REPOSITORY": "jmp0xf/forge-release-authority",
+    "GITHUB_REPOSITORY_ID": "1317240187",
+    "GITHUB_REPOSITORY_OWNER": "jmp0xf",
+    "GITHUB_REPOSITORY_OWNER_ID": "2247932",
+    "GITHUB_SHA": AUTHORITY_COMMIT,
+    "GITHUB_WORKFLOW_REF": verifier.AUTHORITY_WORKFLOW_REF,
+    "GITHUB_WORKFLOW_SHA": AUTHORITY_COMMIT,
+}
 LOCK_BYTES = (
     b"version = 4\n\n"
     b"[[package]]\n"
@@ -29,6 +45,7 @@ LOCK_BYTES = (
     + f'checksum = "{"d" * 64}"\n'.encode("ascii")
 )
 LOCK_DIGEST = hashlib.sha256(LOCK_BYTES).hexdigest()
+NOTICE_BYTES = b"Synthetic fixture notice corpus.\n"
 # Re-run the recorded commands in the Forge checkout at these two input digests,
 # join selected packages to release-baseline, then render the projection below.
 FORGE_SBOM_GRAPH_DERIVATION_RECEIPT: dict[str, Any] = {
@@ -272,11 +289,10 @@ class CandidateFixture:
         self.policy, _ = verifier.load_policy(self.policy_path)
         self.structured_binaries = structured_binaries
         self._write_target_assets()
-        notice_bytes = b"Synthetic fixture notice corpus.\n"
         (self.assets / self.policy["release"]["notice"]["name"]).write_bytes(
-            notice_bytes
+            NOTICE_BYTES
         )
-        self.source_license_notices.write_bytes(notice_bytes)
+        self.source_license_notices.write_bytes(NOTICE_BYTES)
         self.rewrite_manifest_and_checksums()
         self.rewrite_builder_records()
 
@@ -441,15 +457,39 @@ class CandidateFixture:
             (self.records / target["builderRecord"]).write_bytes(json_bytes(record))
 
     def verify(self) -> dict[str, Any]:
-        return verifier.verify_release(
+        return self.verify_with(self.resolved_materials())
+
+    def verify_with(self, materials: verifier._ResolvedMaterials) -> dict[str, Any]:
+        predicate, _subject_checksums = verifier._verify_release_with_subjects(
             self.policy_path,
-            self.cargo_lock,
-            self.source_license_notices,
             self.assets,
             self.records,
             FORGE_COMMIT,
             AUTHORITY_COMMIT,
+            materials,
         )
+        return predicate
+
+    def resolved_materials(self) -> verifier._ResolvedMaterials:
+        return verifier._ResolvedMaterials(
+            cargo_lock=self.cargo_lock.read_bytes(),
+            source_license_notices=self.source_license_notices.read_bytes(),
+            authority_policy=self.policy_path.read_bytes(),
+            authority_verifier=verifier.AUTHORITY_VERIFIER_PATH.read_bytes(),
+        )
+
+    @contextmanager
+    def cli_environment(self) -> Iterator[None]:
+        with (
+            mock.patch.dict(os.environ, ACTIONS_ENVIRONMENT, clear=True),
+            mock.patch.object(verifier, "AUTHORITY_POLICY_PATH", self.policy_path),
+            mock.patch.object(
+                verifier,
+                "_resolve_github_materials",
+                return_value=self.resolved_materials(),
+            ),
+        ):
+            yield
 
 
 class VerifyReleaseTests(unittest.TestCase):
@@ -482,6 +522,14 @@ class VerifyReleaseTests(unittest.TestCase):
         self.assertIs(policy["release"]["binaryStructureCheckRequired"], True)
         self.assertEqual(policy["release"]["notice"]["target"], "all")
         self.assertEqual(policy["toolchain"]["rust"], "1.96.0")
+        self.assertEqual(
+            policy["provenance"],
+            {
+                "predicateType": verifier.SLSA_PROVENANCE_V1,
+                "buildType": verifier.BUILD_TYPE_URI,
+                "builderId": verifier.BUILDER_ID_URI,
+            },
+        )
         self.assertEqual(
             [target["runnerLabel"] for target in policy["targets"]],
             [
@@ -545,6 +593,461 @@ class VerifyReleaseTests(unittest.TestCase):
                 "totalBuilderRecordBytes": 262_144,
             },
         )
+
+    def test_policy_rejects_provenance_identity_drift(self) -> None:
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        for mutation in ("build-type", "builder-id", "legacy-workflow-ref"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                candidate = json.loads(json.dumps(policy))
+                if mutation == "build-type":
+                    candidate["provenance"]["buildType"] = (
+                        "https://example.invalid/build"
+                    )
+                elif mutation == "builder-id":
+                    candidate["provenance"]["builderId"] = (
+                        "https://example.invalid/builder"
+                    )
+                else:
+                    candidate["provenance"]["workflowRef"] = "legacy"
+                path = Path(directory) / "policy.json"
+                path.write_bytes(json_bytes(candidate))
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.load_policy(path)
+
+    def test_policy_rejects_immutable_repository_identity_drift(self) -> None:
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        for section, field in (
+            ("source", "owner"),
+            ("source", "ownerId"),
+            ("source", "repository"),
+            ("source", "repositoryId"),
+            ("authority", "owner"),
+            ("authority", "ownerId"),
+            ("authority", "repository"),
+            ("authority", "repositoryId"),
+        ):
+            with (
+                self.subTest(section=section, field=field),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                candidate = json.loads(json.dumps(policy))
+                candidate[section][field] = 1 if field.endswith("Id") else "different"
+                path = Path(directory) / "policy.json"
+                path.write_bytes(json_bytes(candidate))
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.load_policy(path)
+
+    def test_policy_rejects_builder_authority_drift(self) -> None:
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        for field in ("oidcIssuer", "oidcSubjectPrefix", "environment"):
+            with (
+                self.subTest(field=field),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                candidate = json.loads(json.dumps(policy))
+                candidate["authority"][field] = "different"
+                path = Path(directory) / "policy.json"
+                path.write_bytes(json_bytes(candidate))
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.load_policy(path)
+
+    def test_policy_rejects_builder_target_drift(self) -> None:
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        for index in range(len(policy["targets"])):
+            other = policy["targets"][(index + 1) % len(policy["targets"])]
+            for field in ("runnerLabel", "binaryFormat"):
+                with (
+                    self.subTest(index=index, field=field),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    candidate = json.loads(json.dumps(policy))
+                    candidate["targets"][index][field] = other[field]
+                    path = Path(directory) / "policy.json"
+                    path.write_bytes(json_bytes(candidate))
+                    with self.assertRaises(verifier.VerificationError):
+                        verifier.load_policy(path)
+
+            with (
+                self.subTest(index=index, field="builderRecord"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                candidate = json.loads(json.dumps(policy))
+                next_index = (index + 1) % len(candidate["targets"])
+                current_record = candidate["targets"][index]["builderRecord"]
+                candidate["targets"][index]["builderRecord"] = candidate["targets"][
+                    next_index
+                ]["builderRecord"]
+                candidate["targets"][next_index]["builderRecord"] = current_record
+                path = Path(directory) / "policy.json"
+                path.write_bytes(json_bytes(candidate))
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.load_policy(path)
+
+            with (
+                self.subTest(index=index, field="triple"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                candidate = json.loads(json.dumps(policy))
+                candidate["targets"][index]["triple"] = "different-target"
+                path = Path(directory) / "policy.json"
+                path.write_bytes(json_bytes(candidate))
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.load_policy(path)
+
+            with (
+                self.subTest(index=index, field="subjectPair"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                candidate = json.loads(json.dumps(policy))
+                next_index = (index + 1) % len(candidate["targets"])
+                for field in ("binary", "sbom"):
+                    current_value = candidate["targets"][index][field]
+                    candidate["targets"][index][field] = candidate["targets"][
+                        next_index
+                    ][field]
+                    candidate["targets"][next_index][field] = current_value
+                path = Path(directory) / "policy.json"
+                path.write_bytes(json_bytes(candidate))
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.load_policy(path)
+
+            with (
+                self.subTest(index=index, field="subjectNames"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                candidate = json.loads(json.dumps(policy))
+                target = candidate["targets"][index]
+                old_binary = target["binary"]
+                old_sbom = target["sbom"]
+                target["binary"] = f"renamed-target-{index}"
+                target["sbom"] = f"{target['binary']}.cdx.json"
+                renames = {old_binary: target["binary"], old_sbom: target["sbom"]}
+                candidate["release"]["assets"] = sorted(
+                    renames.get(name, name) for name in candidate["release"]["assets"]
+                )
+                path = Path(directory) / "policy.json"
+                path.write_bytes(json_bytes(candidate))
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.load_policy(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = json.loads(json.dumps(policy))
+            candidate["release"]["notice"]["name"] = "RENAMED-NOTICES.txt"
+            candidate["release"]["assets"] = sorted(
+                "RENAMED-NOTICES.txt" if name == verifier.NOTICE_NAME else name
+                for name in candidate["release"]["assets"]
+            )
+            path = Path(directory) / "policy.json"
+            path.write_bytes(json_bytes(candidate))
+            with self.assertRaises(verifier.VerificationError):
+                verifier.load_policy(path)
+
+    def test_provenance_identity_uris_resolve_to_versioned_contracts(self) -> None:
+        contracts = {
+            verifier.BUILD_TYPE_URI: ROOT / "docs" / "build-types" / "qualify-v1.md",
+            verifier.BUILDER_ID_URI: (
+                ROOT / "docs" / "builders" / "github-actions-protected-v1.md"
+            ),
+        }
+        for uri, path in contracts.items():
+            with self.subTest(uri=uri):
+                self.assertTrue(path.is_file())
+                text = path.read_text(encoding="utf-8")
+                self.assertIn(f"Identity: `{uri}`", text)
+                self.assertIn("no SLSA Build level", text)
+
+    def test_actions_context_derives_only_protected_main_authority_commit(self) -> None:
+        self.assertEqual(
+            verifier._authority_commit_from_actions_environment(ACTIONS_ENVIRONMENT),
+            AUTHORITY_COMMIT,
+        )
+        for name in (
+            "GITHUB_ACTIONS",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_REF",
+            "GITHUB_REF_NAME",
+            "GITHUB_REF_PROTECTED",
+            "GITHUB_REF_TYPE",
+            "GITHUB_REPOSITORY",
+            "GITHUB_REPOSITORY_ID",
+            "GITHUB_REPOSITORY_OWNER",
+            "GITHUB_REPOSITORY_OWNER_ID",
+            "GITHUB_WORKFLOW_REF",
+        ):
+            with self.subTest(name=name):
+                changed = dict(ACTIONS_ENVIRONMENT)
+                changed[name] = "unexpected"
+                with self.assertRaises(verifier.VerificationError):
+                    verifier._authority_commit_from_actions_environment(changed)
+        changed = dict(ACTIONS_ENVIRONMENT)
+        changed["GITHUB_WORKFLOW_SHA"] = "c" * 40
+        with self.assertRaisesRegex(verifier.VerificationError, "workflow commit"):
+            verifier._authority_commit_from_actions_environment(changed)
+
+    def test_github_api_reader_rejects_redirects_and_unbounded_responses(self) -> None:
+        class Headers:
+            def __init__(self, content_type: str, content_length: str | None) -> None:
+                self.content_type = content_type
+                self.content_length = content_length
+
+            def get_content_type(self) -> str:
+                return self.content_type
+
+            def get(self, name: str) -> str | None:
+                return self.content_length if name == "Content-Length" else None
+
+        class Response:
+            def __init__(
+                self,
+                data: bytes,
+                *,
+                url: str = verifier.GITHUB_API_ROOT + "/repositories/1",
+                content_type: str = "application/json",
+                content_length: str | None = None,
+            ) -> None:
+                self.data = data
+                self.url = url
+                self.headers = Headers(content_type, content_length)
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def getcode(self) -> int:
+                return 200
+
+            def geturl(self) -> str:
+                return self.url
+
+            def read(self, amount: int) -> bytes:
+                return self.data[:amount]
+
+        class Opener:
+            def __init__(self, response: Response) -> None:
+                self.response = response
+
+            def open(self, _request: Any, *, timeout: int) -> Response:
+                self.assert_timeout(timeout)
+                return self.response
+
+            @staticmethod
+            def assert_timeout(timeout: int) -> None:
+                if timeout != verifier.GITHUB_API_TIMEOUT_SECONDS:
+                    raise AssertionError(timeout)
+
+        def read(response: Response, limit: int = 64) -> Any:
+            with mock.patch.object(
+                verifier, "build_opener", return_value=Opener(response)
+            ):
+                return verifier._github_api_get("/repositories/1", limit, "fixture")
+
+        self.assertEqual(read(Response(b'{"ok":true}')), {"ok": True})
+        for mutation, response in (
+            (
+                "redirect",
+                Response(b'{"ok":true}', url="https://example.invalid/redirect"),
+            ),
+            ("content-type", Response(b"{}", content_type="text/plain")),
+            ("declared-size", Response(b"{}", content_length="65")),
+            ("huge-declared-size", Response(b"{}", content_length="9" * 100)),
+            ("streamed-size", Response(b"{" + b" " * 64 + b"}")),
+            ("invalid-json", Response(b"{")),
+        ):
+            with (
+                self.subTest(mutation=mutation),
+                self.assertRaises(verifier.VerificationError),
+            ):
+                read(response)
+        with (
+            mock.patch.dict(
+                os.environ, {verifier.GITHUB_API_TOKEN_ENV: "bad\ntoken"}, clear=True
+            ),
+            self.assertRaises(verifier.VerificationError),
+        ):
+            verifier._github_api_get("/repositories/1", 64, "fixture")
+
+    def test_repository_materials_are_bound_to_protected_main_git_objects(self) -> None:
+        repository_id = 1312750430
+        tree_sha = "c" * 40
+        legal_tree_sha = "d" * 40
+        lock_sha = verifier._git_blob_sha(LOCK_BYTES)
+        notice_sha = verifier._git_blob_sha(NOTICE_BYTES)
+        prefix = f"/repositories/{repository_id}"
+        documents: dict[str, Any] = {
+            prefix: {
+                "default_branch": "main",
+                "full_name": "jmp0xf/forge",
+                "id": repository_id,
+                "name": "forge",
+                "owner": {"id": 2247932, "login": "jmp0xf"},
+            },
+            prefix + "/branches/main": {
+                "commit": {"sha": FORGE_COMMIT},
+                "name": "main",
+                "protected": True,
+            },
+            prefix + f"/git/commits/{FORGE_COMMIT}": {
+                "sha": FORGE_COMMIT,
+                "tree": {"sha": tree_sha},
+            },
+            prefix + f"/git/trees/{tree_sha}": {
+                "sha": tree_sha,
+                "tree": [
+                    {
+                        "mode": "100644",
+                        "path": "Cargo.lock",
+                        "sha": lock_sha,
+                        "type": "blob",
+                    },
+                    {
+                        "mode": "040000",
+                        "path": "legal",
+                        "sha": legal_tree_sha,
+                        "type": "tree",
+                    },
+                ],
+                "truncated": False,
+            },
+            prefix + f"/git/trees/{legal_tree_sha}": {
+                "sha": legal_tree_sha,
+                "tree": [
+                    {
+                        "mode": "100644",
+                        "path": "THIRD-PARTY-LICENSES.txt",
+                        "sha": notice_sha,
+                        "type": "blob",
+                    }
+                ],
+                "truncated": False,
+            },
+            prefix + f"/git/blobs/{lock_sha}": {
+                "content": base64.b64encode(LOCK_BYTES).decode("ascii"),
+                "encoding": "base64",
+                "sha": lock_sha,
+                "size": len(LOCK_BYTES),
+            },
+            prefix + f"/git/blobs/{notice_sha}": {
+                "content": base64.b64encode(NOTICE_BYTES).decode("ascii"),
+                "encoding": "base64",
+                "sha": notice_sha,
+                "size": len(NOTICE_BYTES),
+            },
+        }
+
+        def resolve(candidate: dict[str, Any]) -> dict[str, bytes]:
+            def api_get(path: str, _limit: int, _label: str) -> Any:
+                if path not in candidate:
+                    raise verifier.VerificationError(f"unexpected API path {path}")
+                return json.loads(json.dumps(candidate[path]))
+
+            return verifier._resolve_repository_files(
+                {
+                    "owner": "jmp0xf",
+                    "ownerId": 2247932,
+                    "repository": "forge",
+                    "repositoryId": repository_id,
+                },
+                FORGE_COMMIT,
+                {"Cargo.lock": 1024, "legal/THIRD-PARTY-LICENSES.txt": 1024},
+                api_get,
+            )
+
+        self.assertEqual(
+            resolve(documents),
+            {
+                "Cargo.lock": LOCK_BYTES,
+                "legal/THIRD-PARTY-LICENSES.txt": NOTICE_BYTES,
+            },
+        )
+
+        def mutate(name: str, candidate: dict[str, Any]) -> None:
+            if name == "repository-id":
+                candidate[prefix]["id"] = 1
+            elif name == "owner-id":
+                candidate[prefix]["owner"]["id"] = 1
+            elif name == "unprotected-main":
+                candidate[prefix + "/branches/main"]["protected"] = False
+            elif name == "non-head-commit":
+                candidate[prefix + "/branches/main"]["commit"]["sha"] = "e" * 40
+            elif name == "commit-sha":
+                candidate[prefix + f"/git/commits/{FORGE_COMMIT}"]["sha"] = "e" * 40
+            elif name == "tree-sha":
+                candidate[prefix + f"/git/trees/{tree_sha}"]["sha"] = "e" * 40
+            elif name == "truncated-tree":
+                candidate[prefix + f"/git/trees/{tree_sha}"]["truncated"] = True
+            elif name == "symlink":
+                candidate[prefix + f"/git/trees/{tree_sha}"]["tree"][0]["mode"] = (
+                    "120000"
+                )
+            elif name == "submodule":
+                entry = candidate[prefix + f"/git/trees/{tree_sha}"]["tree"][0]
+                entry["mode"] = "160000"
+                entry["type"] = "commit"
+            elif name == "missing-file":
+                candidate[prefix + f"/git/trees/{tree_sha}"]["tree"].pop(0)
+            elif name == "duplicate-file":
+                entries = candidate[prefix + f"/git/trees/{tree_sha}"]["tree"]
+                entries.append(json.loads(json.dumps(entries[0])))
+            elif name == "blob-sha":
+                candidate[prefix + f"/git/blobs/{lock_sha}"]["sha"] = "e" * 40
+            elif name == "blob-size":
+                candidate[prefix + f"/git/blobs/{lock_sha}"]["size"] = 2048
+            elif name == "blob-content":
+                candidate[prefix + f"/git/blobs/{lock_sha}"]["content"] = "YQ=="
+            else:
+                raise AssertionError(name)
+
+        for mutation in (
+            "repository-id",
+            "owner-id",
+            "unprotected-main",
+            "non-head-commit",
+            "commit-sha",
+            "tree-sha",
+            "truncated-tree",
+            "symlink",
+            "submodule",
+            "missing-file",
+            "duplicate-file",
+            "blob-sha",
+            "blob-size",
+            "blob-content",
+        ):
+            with self.subTest(mutation=mutation):
+                candidate = json.loads(json.dumps(documents))
+                mutate(mutation, candidate)
+                with self.assertRaises(verifier.VerificationError):
+                    resolve(candidate)
+
+    def test_authority_materials_match_the_executed_policy_and_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            materials = fixture.resolved_materials()
+            for mutation in ("policy", "verifier"):
+                with self.subTest(mutation=mutation):
+                    changed = verifier._ResolvedMaterials(
+                        cargo_lock=materials.cargo_lock,
+                        source_license_notices=materials.source_license_notices,
+                        authority_policy=(
+                            b"{}\n"
+                            if mutation == "policy"
+                            else materials.authority_policy
+                        ),
+                        authority_verifier=(
+                            b"changed\n"
+                            if mutation == "verifier"
+                            else materials.authority_verifier
+                        ),
+                    )
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError, f"authority {mutation} differs"
+                    ):
+                        fixture.verify_with(changed)
 
     def test_policy_requires_a_bounded_exact_sbom_graph_contract(self) -> None:
         policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
@@ -702,9 +1205,12 @@ class VerifyReleaseTests(unittest.TestCase):
                         (root / "item").write_bytes(b"replacement")
                     return real_open(path, flags, mode, dir_fd=dir_fd)
 
-                with mock.patch.object(
-                    verifier, "_require_secure_posix_fs_capabilities"
-                ), mock.patch.object(os, "open", side_effect=swap_directory_open):
+                with (
+                    mock.patch.object(
+                        verifier, "_require_secure_posix_fs_capabilities"
+                    ),
+                    mock.patch.object(os, "open", side_effect=swap_directory_open),
+                ):
                     with self.assertRaisesRegex(
                         verifier.VerificationError, "directory changed before"
                     ):
@@ -739,9 +1245,12 @@ class VerifyReleaseTests(unittest.TestCase):
                         item.write_bytes(b"replacement")
                     return real_open(path, flags, mode, dir_fd=dir_fd)
 
-                with mock.patch.object(
-                    verifier, "_require_secure_posix_fs_capabilities"
-                ), mock.patch.object(os, "open", side_effect=swap_entry_open):
+                with (
+                    mock.patch.object(
+                        verifier, "_require_secure_posix_fs_capabilities"
+                    ),
+                    mock.patch.object(os, "open", side_effect=swap_entry_open),
+                ):
                     with self.assertRaisesRegex(
                         verifier.VerificationError, "changed before it was opened"
                     ):
@@ -896,38 +1405,130 @@ class VerifyReleaseTests(unittest.TestCase):
             fixture = self.fixture(directory)
             first = fixture.verify()
             second = fixture.verify()
-            expected_subjects = [
+            expected_policy_digest = sha256(fixture.policy_path.read_bytes())
+            expected_byproducts = [
                 {
-                    "digest": {"sha256": sha256((fixture.assets / name).read_bytes())},
-                    "length": len((fixture.assets / name).read_bytes()),
-                    "name": name,
+                    "digest": {
+                        "sha256": sha256(
+                            (fixture.records / target["builderRecord"]).read_bytes()
+                        )
+                    },
+                    "name": target["builderRecord"],
                 }
-                for name in fixture.policy["release"]["assets"]
+                for target in sorted(
+                    fixture.policy["targets"], key=lambda item: item["builderRecord"]
+                )
             ]
         self.assertEqual(first, second)
-        dependencies = first["buildDefinition"]["resolvedDependencies"]
-        self.assertEqual(dependencies[0]["digest"], {"gitCommit": FORGE_COMMIT})
-        self.assertEqual(dependencies[1]["digest"], {"gitCommit": AUTHORITY_COMMIT})
+        self.assertEqual(set(first), {"buildDefinition", "runDetails"})
+        build_definition = first["buildDefinition"]
         self.assertEqual(
-            len(
-                first["buildDefinition"]["internalParameters"]["release"][
-                    "subjectNames"
-                ]
-            ),
-            13,
+            set(build_definition),
+            {
+                "buildType",
+                "externalParameters",
+                "internalParameters",
+                "resolvedDependencies",
+            },
         )
-        subjects = first["buildDefinition"]["internalParameters"]["release"]["subjects"]
-        self.assertEqual(subjects, expected_subjects)
-        self.assertEqual(len(first["runDetails"]["byproducts"]), 5)
+        self.assertEqual(build_definition["buildType"], verifier.BUILD_TYPE_URI)
+        self.assertEqual(
+            build_definition["externalParameters"], {"sourceCommit": FORGE_COMMIT}
+        )
+        dependencies = first["buildDefinition"]["resolvedDependencies"]
+        self.assertEqual(len(dependencies), 4)
+        dependencies_by_uri = {
+            dependency["uri"]: dependency for dependency in dependencies
+        }
+        self.assertEqual(
+            dependencies_by_uri[
+                f"git+https://github.com/jmp0xf/forge.git@{FORGE_COMMIT}"
+            ],
+            {
+                "uri": f"git+https://github.com/jmp0xf/forge.git@{FORGE_COMMIT}",
+                "digest": {"gitCommit": FORGE_COMMIT},
+            },
+        )
+        self.assertEqual(
+            dependencies_by_uri[
+                "git+https://github.com/jmp0xf/forge-release-authority.git@"
+                + AUTHORITY_COMMIT
+            ],
+            {
+                "uri": (
+                    "git+https://github.com/jmp0xf/forge-release-authority.git@"
+                    + AUTHORITY_COMMIT
+                ),
+                "digest": {"gitCommit": AUTHORITY_COMMIT},
+            },
+        )
+        cargo_uri = f"https://github.com/jmp0xf/forge/blob/{FORGE_COMMIT}/Cargo.lock"
+        notices_uri = (
+            "https://github.com/jmp0xf/forge/blob/"
+            f"{FORGE_COMMIT}/THIRD-PARTY-LICENSES.txt"
+        )
+        self.assertEqual(
+            dependencies_by_uri[cargo_uri],
+            {
+                "name": "Cargo.lock",
+                "uri": cargo_uri,
+                "digest": {"sha256": sha256(LOCK_BYTES)},
+            },
+        )
+        self.assertEqual(
+            dependencies_by_uri[notices_uri],
+            {
+                "name": "THIRD-PARTY-LICENSES.txt",
+                "uri": notices_uri,
+                "digest": {"sha256": sha256(NOTICE_BYTES)},
+            },
+        )
+        internal = build_definition["internalParameters"]
+        self.assertEqual(
+            set(internal), {"authority", "authorityCommit", "policySha256", "release"}
+        )
+        self.assertEqual(
+            internal["authority"],
+            {
+                "environment": "forge-release",
+                "oidcIssuer": "https://token.actions.githubusercontent.com",
+                "oidcSubjectPrefix": (
+                    "repo:jmp0xf@2247932/forge-release-authority@1317240187"
+                ),
+                "ownerId": 2247932,
+                "repositoryId": 1317240187,
+            },
+        )
+        self.assertEqual(internal["authorityCommit"], AUTHORITY_COMMIT)
+        self.assertEqual(internal["policySha256"], expected_policy_digest)
+        release = internal["release"]
+        self.assertEqual(set(release), {"subjectNames", "tag", "targets", "version"})
+        self.assertEqual(release["subjectNames"], fixture.policy["release"]["assets"])
+        self.assertEqual(release["tag"], "v0.1.0-rc.2")
+        self.assertEqual(
+            release["targets"],
+            [target["triple"] for target in fixture.policy["targets"]],
+        )
+        self.assertEqual(release["version"], "0.1.0-rc.2")
+        self.assertNotIn("subjects", release)
+        self.assertEqual(
+            set(first["runDetails"]), {"builder", "byproducts", "metadata"}
+        )
+        self.assertEqual(
+            first["runDetails"]["builder"], {"id": verifier.BUILDER_ID_URI}
+        )
+        self.assertEqual(first["runDetails"]["metadata"], {})
+        self.assertEqual(first["runDetails"]["byproducts"], expected_byproducts)
         self.assertEqual(
             verifier._canonical_json(first), verifier._canonical_json(second)
         )
 
     def test_sbom_graph_contract_rejects_subset_license_and_edge_drift(self) -> None:
         for mutation in ("subset", "license", "edge"):
-            with self.subTest(
-                mutation=mutation
-            ), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 fixture = self.fixture(directory)
                 target = fixture.policy["targets"][0]
                 sbom_path = fixture.assets / target["sbom"]
@@ -1040,9 +1641,10 @@ class VerifyReleaseTests(unittest.TestCase):
 
     def test_rejects_manifest_v1_unknown_fields_and_duplicate_json_keys(self) -> None:
         for mutation_name in ("v1", "unknown", "duplicate"):
-            with self.subTest(
-                mutation=mutation_name
-            ), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(mutation=mutation_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 fixture = self.fixture(directory)
                 manifest_path = fixture.assets / "release-manifest.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1305,31 +1907,41 @@ class VerifyReleaseTests(unittest.TestCase):
             output = output_directory / "predicate.json"
             subject_checksums = output_directory / "subject-checksums.txt"
             arguments = [
-                "--policy",
-                str(fixture.policy_path),
                 "--assets",
                 str(fixture.assets),
                 "--builder-records",
                 str(fixture.records),
-                "--cargo-lock",
-                str(fixture.cargo_lock),
-                "--source-license-notices",
-                str(fixture.source_license_notices),
                 "--forge-commit",
                 FORGE_COMMIT,
-                "--authority-commit",
-                AUTHORITY_COMMIT,
                 "--predicate-out",
                 str(output),
                 "--subject-checksums-out",
                 str(subject_checksums),
             ]
-            with redirect_stderr(io.StringIO()), self.assertRaises(
-                SystemExit
-            ) as bypass_flag:
+            with (
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as bypass_flag,
+            ):
                 verifier._parse_arguments(arguments + ["--skip-binary-structure"])
             self.assertEqual(bypass_flag.exception.code, 2)
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            for removed_option in (
+                "--policy",
+                "--cargo-lock",
+                "--source-license-notices",
+                "--authority-commit",
+            ):
+                with (
+                    self.subTest(removed_option=removed_option),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit) as removed,
+                ):
+                    verifier._parse_arguments(arguments + [removed_option, "untrusted"])
+                self.assertEqual(removed.exception.code, 2)
+            with (
+                fixture.cli_environment(),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(arguments), 0)
             predicate = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -1344,12 +1956,20 @@ class VerifyReleaseTests(unittest.TestCase):
                 subject_checksums.read_text(encoding="ascii").splitlines(),
                 expected_subject_lines,
             )
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(arguments), 1)
             output.unlink()
             subject_checksums.unlink()
             output.write_text("occupied\n", encoding="utf-8")
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(arguments), 1)
             self.assertFalse(subject_checksums.exists())
             output.unlink()
@@ -1359,25 +1979,41 @@ class VerifyReleaseTests(unittest.TestCase):
             colliding_outputs[colliding_outputs.index(str(subject_checksums))] = str(
                 same_output
             )
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(colliding_outputs), 1)
             self.assertFalse(same_output.exists())
             unrelated = output_directory / "unrelated"
             unrelated.write_text("occupied\n", encoding="utf-8")
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(arguments), 1)
             self.assertFalse(output.exists())
             self.assertFalse(subject_checksums.exists())
             unrelated.unlink()
             output_directory.chmod(0o755)
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(arguments), 1)
             output_directory.chmod(0o700)
             inside_inputs = list(arguments)
             inside_inputs[inside_inputs.index(str(output))] = str(
                 fixture.assets / "predicate.json"
             )
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(inside_inputs), 1)
 
     def test_cli_binds_actual_input_and_output_directory_inodes(self) -> None:
@@ -1396,20 +2032,12 @@ class VerifyReleaseTests(unittest.TestCase):
                 predicate = output_directory / "predicate.json"
                 checksums = output_directory / "subject-checksums.txt"
                 arguments = [
-                    "--policy",
-                    str(fixture.policy_path),
                     "--assets",
                     str(alias / "assets"),
                     "--builder-records",
                     str(fixture.records),
-                    "--cargo-lock",
-                    str(fixture.cargo_lock),
-                    "--source-license-notices",
-                    str(fixture.source_license_notices),
                     "--forge-commit",
                     FORGE_COMMIT,
-                    "--authority-commit",
-                    AUTHORITY_COMMIT,
                     "--predicate-out",
                     str(predicate),
                     "--subject-checksums-out",
@@ -1422,11 +2050,16 @@ class VerifyReleaseTests(unittest.TestCase):
                     alias.symlink_to(replacement, target_is_directory=True)
                     return real_verify(*args, **kwargs)
 
-                with mock.patch.object(
-                    verifier,
-                    "_verify_release_with_pinned_directories",
-                    side_effect=swap_input_ancestor,
-                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                with (
+                    fixture.cli_environment(),
+                    mock.patch.object(
+                        verifier,
+                        "_verify_release_with_pinned_directories",
+                        side_effect=swap_input_ancestor,
+                    ),
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(io.StringIO()),
+                ):
                     self.assertEqual(verifier.main(arguments), 1)
                 self.assertFalse(predicate.exists())
                 self.assertFalse(checksums.exists())
@@ -1477,20 +2110,12 @@ class VerifyReleaseTests(unittest.TestCase):
             predicate = output_directory / "predicate.json"
             checksums = output_directory / "subject-checksums.txt"
             arguments = [
-                "--policy",
-                str(fixture.policy_path),
                 "--assets",
                 str(fixture.assets),
                 "--builder-records",
                 str(fixture.records),
-                "--cargo-lock",
-                str(fixture.cargo_lock),
-                "--source-license-notices",
-                str(fixture.source_license_notices),
                 "--forge-commit",
                 FORGE_COMMIT,
-                "--authority-commit",
-                AUTHORITY_COMMIT,
                 "--predicate-out",
                 str(predicate),
                 "--subject-checksums-out",
@@ -1510,11 +2135,16 @@ class VerifyReleaseTests(unittest.TestCase):
                 created.append(result)
                 return result
 
-            with mock.patch.object(
-                verifier,
-                "_write_create_only",
-                side_effect=tamper_first_during_second_write,
-            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                mock.patch.object(
+                    verifier,
+                    "_write_create_only",
+                    side_effect=tamper_first_during_second_write,
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(arguments), 1)
             self.assertTrue(predicate.exists())
             self.assertTrue(checksums.read_bytes().startswith(b"X"))
@@ -1547,20 +2177,12 @@ class VerifyReleaseTests(unittest.TestCase):
 
             def arguments(predicate: Path, checksums: Path) -> list[str]:
                 return [
-                    "--policy",
-                    str(fixture.policy_path),
                     "--assets",
                     str(fixture.assets),
                     "--builder-records",
                     str(fixture.records),
-                    "--cargo-lock",
-                    str(fixture.cargo_lock),
-                    "--source-license-notices",
-                    str(fixture.source_license_notices),
                     "--forge-commit",
                     FORGE_COMMIT,
-                    "--authority-commit",
-                    AUTHORITY_COMMIT,
                     "--predicate-out",
                     str(predicate),
                     "--subject-checksums-out",
@@ -1573,10 +2195,13 @@ class VerifyReleaseTests(unittest.TestCase):
             safe_output_directory = root / "safe-outputs"
             safe_output_directory.mkdir(mode=0o700)
             safe_checksums = safe_output_directory / "safe-checksums.txt"
-            with mock.patch.object(
-                verifier, "_verify_release_with_pinned_directories"
-            ) as verify_mock, redirect_stdout(io.StringIO()), redirect_stderr(
-                io.StringIO()
+            with (
+                fixture.cli_environment(),
+                mock.patch.object(
+                    verifier, "_verify_release_with_pinned_directories"
+                ) as verify_mock,
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
             ):
                 self.assertEqual(
                     verifier.main(arguments(descendant_predicate, safe_checksums)), 1
@@ -1587,10 +2212,13 @@ class VerifyReleaseTests(unittest.TestCase):
 
             casefold_predicate = root / "Qualification.json"
             casefold_checksums = root / "qualification.JSON"
-            with mock.patch.object(
-                verifier, "_verify_release_with_pinned_directories"
-            ) as verify_mock, redirect_stdout(io.StringIO()), redirect_stderr(
-                io.StringIO()
+            with (
+                fixture.cli_environment(),
+                mock.patch.object(
+                    verifier, "_verify_release_with_pinned_directories"
+                ) as verify_mock,
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
             ):
                 self.assertEqual(
                     verifier.main(arguments(casefold_predicate, casefold_checksums)), 1
@@ -1601,10 +2229,13 @@ class VerifyReleaseTests(unittest.TestCase):
 
             symlink_parent = root / "output-link"
             symlink_parent.symlink_to(root, target_is_directory=True)
-            with mock.patch.object(
-                verifier, "_verify_release_with_pinned_directories"
-            ) as verify_mock, redirect_stdout(io.StringIO()), redirect_stderr(
-                io.StringIO()
+            with (
+                fixture.cli_environment(),
+                mock.patch.object(
+                    verifier, "_verify_release_with_pinned_directories"
+                ) as verify_mock,
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
             ):
                 self.assertEqual(
                     verifier.main(
@@ -1634,11 +2265,16 @@ class VerifyReleaseTests(unittest.TestCase):
                 alias.symlink_to(fixture.assets, target_is_directory=True)
                 return {}, b"synthetic checksums\n"
 
-            with mock.patch.object(
-                verifier,
-                "_verify_release_with_pinned_directories",
-                side_effect=swap_output_ancestor,
-            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                mock.patch.object(
+                    verifier,
+                    "_verify_release_with_pinned_directories",
+                    side_effect=swap_output_ancestor,
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(
                     verifier.main(arguments(aliased_predicate, safe_checksums)), 1
                 )
@@ -1661,11 +2297,16 @@ class VerifyReleaseTests(unittest.TestCase):
                 output_directory.symlink_to(fixture.assets, target_is_directory=True)
                 return {}, b"synthetic checksums\n"
 
-            with mock.patch.object(
-                verifier,
-                "_verify_release_with_pinned_directories",
-                side_effect=swap_output_parent,
-            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                fixture.cli_environment(),
+                mock.patch.object(
+                    verifier,
+                    "_verify_release_with_pinned_directories",
+                    side_effect=swap_output_parent,
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 self.assertEqual(verifier.main(arguments(predicate, checksums)), 1)
             self.assertFalse((detached_directory / predicate.name).exists())
             self.assertFalse((detached_directory / checksums.name).exists())
