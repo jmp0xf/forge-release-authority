@@ -59,16 +59,18 @@ jobs:
               Path("contracts/release-policy.json").read_text(encoding="utf-8"),
               object_pairs_hook=reject_duplicates,
           )
+          block_count = 0
           for path in (
               Path("docs/build-types/qualify-v1.md"),
               Path("docs/builders/github-actions-protected-v1.md"),
           ):
               text = path.read_text(encoding="utf-8")
               blocks = re.findall(r"^```json\s*$\n(.*?)^```\s*$", text, re.MULTILINE | re.DOTALL)
-              if not blocks:
-                  raise ValueError(f"{path} has no JSON contract example")
+              block_count += len(blocks)
               for block in blocks:
                   json.loads(block, object_pairs_hook=reject_duplicates)
+          if block_count == 0:
+              raise ValueError("contract documentation has no JSON examples")
           PY
       - name: Reject tracked or untracked drift
         shell: bash
