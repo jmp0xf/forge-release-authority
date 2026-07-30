@@ -120,8 +120,8 @@
   },
   "provenance": {
     "predicateType": "https://slsa.dev/provenance/v1",
-    "buildType": "https://github.com/jmp0xf/forge-release-authority/qualify/v1",
-    "workflowRef": "https://github.com/jmp0xf/forge-release-authority/.github/workflows/qualify.yml@refs/heads/main"
+    "buildType": "https://github.com/jmp0xf/forge-release-authority/blob/main/docs/build-types/qualify-v1.md",
+    "builderId": "https://github.com/jmp0xf/forge-release-authority/blob/main/docs/builders/github-actions-protected-v1.md"
   },
   "limits": {
     "binaryBytes": 67108864,
