@@ -7,7 +7,8 @@ Status: inactive bootstrap contract; no SLSA Build level is claimed.
 This document defines the trust boundary and provenance guarantees intended for the protected GitHub Actions mode of
 the Forge release authority. The identity names a particular operating mode, not GitHub Actions in general and not an
 individual workflow file. It becomes usable only after its workflow and platform controls are installed, reviewed,
-and independently verified.
+and independently verified. The checked-in workflow is initially a non-release canary; its presence alone does not
+activate this builder identity.
 
 ## Scope and trust base
 
@@ -30,7 +31,7 @@ The current single-owner arrangement is accountability, not independent second-p
 
 ## Permission-separated jobs
 
-This builder mode has three non-interchangeable permission domains.
+This builder mode has four job roles across three non-interchangeable permission domains.
 
 ### Native build jobs
 
@@ -53,6 +54,15 @@ binary, one SBOM, and one bounded builder record.
 The finalize job may execute the candidate's `release-finalize` and `release-check` commands and assemble workflow
 artifacts. It has the same unprivileged boundary as native jobs: no OIDC token, protected environment, secret,
 attestation permission, or release write. Candidate-generated checks remain useful evidence but are not authority.
+
+### Preflight and independent qualification jobs
+
+The preflight job binds both repositories to their immutable identities and protected public `main` heads before any
+candidate execution. After finalization, a separate unprivileged job checks out only the authority repository and
+runs the complete verifier over fresh copies of the downloaded files. Neither job receives a secret, OIDC token,
+protected environment, attestation permission, or release permission. The independent job's predicate and checksums
+are a deterministic preview only: the protected job downloads the original finalized artifacts, reruns the complete
+verifier in new private directories, and requires byte-for-byte equality before attestation.
 
 ### Protected attest job
 
@@ -115,10 +125,20 @@ verification must bind all of the following:
 - this exact `builder.id` and build-type URI;
 - the expected keyless transparency-log policy.
 
-The executable-workflow pull request must record the exact certificate/workflow identity emitted by the selected
-attestation action and add a verifier test for that signer-builder pair. A signer valid for another repository,
-workflow, ref, environment, self-hosted mode, or unprotected mode is not valid for this builder. Conversely, this
-signer must not attest a different builder identity.
+Activation is deliberately two-stage. The executable-workflow change freezes the intended identity constraints but
+leaves the builder inactive. After that change and the hosted controls are merged, a first protected run is a
+non-release canary: it must record the actual certificate/workflow identity emitted by the selected attestation action
+and verify the bundle cryptographically against the exact repository, workflow, ref, commit, issuer, subject digests,
+and GitHub-hosted runner boundary. A follow-up reviewed change must preserve representative signer evidence and add an
+automated verifier test for that exact signer-builder pair before any run counts as release qualification. A signer
+valid for another repository, workflow, ref, environment, self-hosted mode, or unprotected mode is not valid for this
+builder. Conversely, this signer must not attest a different builder identity.
+
+The follow-up freezes stable issuer, certificate, workflow/ref, environment, and immutable repository identity
+constraints; it must not turn the canary's authority commit into a permanent signer constant. For each attestation,
+the dynamic signer and source commit must instead equal the predicate's `authorityCommit` and the protected authority
+`main` commit for that invocation. Canary evidence tests must cover the observed field shape plus positive and negative
+signer-builder pairings.
 
 ## Operational controls
 
@@ -144,22 +164,30 @@ environment rejection, signer mismatch, or incomplete attestation fails the invo
 directory. Do not delete and recreate a tag, release, attestation, or asset to conceal a failed run; start a new
 reviewed invocation or, if the candidate changes, a new candidate.
 
+Workflow artifact names are immutable within one run and uploads use `overwrite: false`. Preserve every old attempt
+and its evidence. After any failure, approval rejection, or incomplete attestation, do not use GitHub's "re-run all
+jobs", "re-run failed jobs", or individual-job controls; start a new workflow dispatch so every handoff has a new run
+identity. Intermediate handoffs are retained for 30 days to allow protected-environment review; qualified evidence is
+retained for 90 days.
+
 If signer identity, workflow protection, repository ownership, hosted runner trust, or environment enforcement is
 uncertain, consumers must treat the builder as unavailable rather than downgrade silently.
 
 ## SLSA level and limitations
 
-No SLSA Build level is currently claimed. The repository is still bootstrapping: the executable workflow and its
-signer-builder verification have not yet been merged, the environment controls require final platform verification,
-and the single-owner topology does not provide independent second-person review. A future level claim requires an
-independent assessment of the deployed platform against the then-current SLSA requirements; changing this sentence is
-not such an assessment.
+No SLSA Build level is currently claimed. The repository is still bootstrapping: the executable workflow is installed
+only for an inactive canary, signer-builder verification remains a required follow-up, the environment controls require
+final platform verification, and the single-owner topology does not provide independent second-person review. A future
+level claim requires an independent assessment of the deployed platform against the then-current SLSA requirements;
+changing this sentence is not such an assessment.
 
 Known scope limits include GitHub-hosted service trust, platform administrators, the approval owner, pinned third-party
 attestation infrastructure, and best-effort completeness of dependencies outside the four qualification inputs. The
 builder-record byproducts describe selected workload facts; they do not prove the hosted runner image, compiler
 wrapper, linker, dependency cache, or every transitive builder dependency unless the deployed workflow records and
-verifies them.
+verifies them. Before activation, the non-release canary must capture and the follow-up change must freeze or
+conservatively verify the effective package sources, compiler/linker and SDK inputs, runtime-library allowlist, runner
+image identity, and cache/environment behavior observed on all five native targets.
 
 ## Versioning
 
