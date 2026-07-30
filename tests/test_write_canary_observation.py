@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from scripts import write_canary_observation as observations
+
+
+SOURCE_COMMIT = "1" * 40
+AUTHORITY_COMMIT = "2" * 40
+TARGET = "x86_64-apple-darwin"
+
+
+class CanaryObservationTests(unittest.TestCase):
+    def test_builds_allowlisted_record_and_writes_create_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "forge"
+            binary.write_bytes(b"native-binary")
+            cargo_home = root / "cargo-home"
+            cache = cargo_home / "registry" / "cache" / "index.example-123"
+            cache.mkdir(parents=True)
+            (cache / "alpha-1.0.0.crate").write_bytes(b"alpha")
+            (cache / "beta-2.0.0.crate").write_bytes(b"beta")
+            rustlib = root / "rustlib"
+            rustlib.mkdir()
+            (rustlib / "libcore.rlib").write_bytes(b"core")
+            environment = {
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "oidc-must-not-appear",
+                "GITHUB_TOKEN": "github-must-not-appear",
+                "GITHUB_WORKSPACE": os.fspath(root),
+                "ImageOS": "macos15",
+                "ImageVersion": "20260728.1",
+                "RUNNER_ARCH": "X64",
+                "RUNNER_ENVIRONMENT": "github-hosted",
+                "RUNNER_OS": "macOS",
+            }
+
+            with (
+                mock.patch.object(
+                    observations,
+                    "_tool_observations",
+                    return_value=(
+                        {"commands": {}, "executables": {}, "python": {}},
+                        rustlib,
+                    ),
+                ),
+                mock.patch.object(
+                    observations,
+                    "_platform_observation",
+                    return_value=({"commands": {}, "executables": {}}, {}, []),
+                ),
+            ):
+                record = observations.build_observation(
+                    target=TARGET,
+                    source_commit=SOURCE_COMMIT,
+                    authority_commit=AUTHORITY_COMMIT,
+                    binary=binary,
+                    cargo_home=cargo_home,
+                    environment=environment,
+                    system="Darwin",
+                )
+
+            self.assertEqual(record["schema"], observations.SCHEMA)
+            self.assertEqual(record["purpose"], observations.PURPOSE)
+            self.assertEqual(record["target"], TARGET)
+            self.assertEqual(
+                record["binary"]["sha256"], hashlib.sha256(b"native-binary").hexdigest()
+            )
+            cache_record = record["cargo_registry_archive_cache"]
+            self.assertEqual(cache_record["entry_count"], 2)
+            self.assertEqual(
+                [entry["name"] for entry in cache_record["entries"]],
+                [
+                    "index.example-123/alpha-1.0.0.crate",
+                    "index.example-123/beta-2.0.0.crate",
+                ],
+            )
+            self.assertEqual(record["target_rustlib"]["entry_count"], 1)
+            serialized = json.dumps(record, sort_keys=True)
+            self.assertNotIn("oidc-must-not-appear", serialized)
+            self.assertNotIn("github-must-not-appear", serialized)
+            self.assertNotIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN", serialized)
+            self.assertNotIn("GITHUB_TOKEN", serialized)
+
+            output_directory = root / "observation"
+            output = observations.write_observation(output_directory, TARGET, record)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), record)
+            self.assertLessEqual(output.stat().st_size, observations.MAX_OUTPUT_BYTES)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(output_directory.stat().st_mode), 0o700)
+            with self.assertRaisesRegex(
+                observations.ObservationError, "fresh observation output directory"
+            ):
+                observations.write_observation(output_directory, TARGET, record)
+
+    def test_command_capture_redacts_paths_and_secret_assignments(self) -> None:
+        workspace = "/private/runner/work/repository"
+        environment = {"GITHUB_WORKSPACE": workspace}
+        replacements = observations._path_replacements(environment)
+        command = observations._run_command(
+            [
+                sys.executable,
+                "-c",
+                f"print({workspace!r} + '/tool'); print('token=visible-value')",
+            ],
+            environment,
+            replacements,
+        )
+        rendered = json.dumps(command, sort_keys=True)
+        self.assertEqual(command["status"], "ok")
+        self.assertIn("$GITHUB_WORKSPACE/tool", rendered)
+        self.assertNotIn(workspace, rendered)
+        self.assertNotIn("visible-value", rendered)
+        self.assertIn("token=<redacted>", rendered)
+
+    def test_command_capture_kills_output_above_hard_limit(self) -> None:
+        with (
+            mock.patch.object(observations, "MAX_COMMAND_STREAM_BYTES", 1024),
+            mock.patch.object(observations, "MAX_RETAINED_STREAM_BYTES", 128),
+            mock.patch.object(observations, "MAX_COMMAND_SECONDS", 2.0),
+        ):
+            command = observations._run_command(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 65536)"],
+                {},
+                [],
+            )
+        self.assertEqual(command["status"], "output-limit")
+        self.assertGreater(command["stdout_total_bytes"], 1024)
+        self.assertLessEqual(len(command["stdout"]), 128)
+        self.assertTrue(command["stdout_truncated"])
+
+    def test_path_command_keeps_raw_path_private_but_available_to_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            selected = Path(temporary) / "selected-tool"
+            environment = {"GITHUB_WORKSPACE": temporary}
+            command, raw_path = observations._run_path_command(
+                [sys.executable, "-c", f"print({os.fspath(selected)!r})"],
+                environment,
+                observations._path_replacements(environment),
+            )
+        self.assertEqual(raw_path, selected)
+        rendered = json.dumps(command, sort_keys=True)
+        self.assertIn("$GITHUB_WORKSPACE/selected-tool", rendered)
+        self.assertNotIn(temporary, rendered)
+
+    def test_cache_manifest_rejects_symlink_and_entry_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside.crate"
+            outside.write_bytes(b"outside")
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "linked.crate").symlink_to(outside)
+            with self.assertRaisesRegex(observations.ObservationError, "symbolic link"):
+                observations._directory_manifest(
+                    cache,
+                    observations.HashBudget(),
+                    suffix=".crate",
+                    per_file_limit=1024,
+                    label="cache",
+                )
+
+            (cache / "linked.crate").unlink()
+            (cache / "one.crate").write_bytes(b"one")
+            (cache / "two.crate").write_bytes(b"two")
+            with (
+                mock.patch.object(observations, "MAX_MANIFEST_ENTRIES", 1),
+                self.assertRaisesRegex(observations.ObservationError, "manifest entry limit"),
+            ):
+                observations._directory_manifest(
+                    cache,
+                    observations.HashBudget(),
+                    suffix=".crate",
+                    per_file_limit=1024,
+                    label="cache",
+                )
+
+    def test_hash_budget_rejects_oversized_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "large"
+            path.write_bytes(b"12345")
+            budget = observations.HashBudget(remaining=4)
+            with self.assertRaisesRegex(observations.ObservationError, "total byte limit"):
+                budget.digest_regular_file(path, 1024, "large input")
+
+    def test_windows_probe_declares_internal_msvc_environment_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "forge.exe"
+            binary.write_bytes(b"MZ")
+            environment = {
+                "INCLUDE": "must-not-be-recorded",
+                "LIB": "must-not-be-recorded",
+                "PATH": os.environ.get("PATH", ""),
+                "VCToolsInstallDir": "must-not-be-recorded",
+            }
+            platform_record, runtime, limitations = observations._platform_observation(
+                "Windows",
+                binary,
+                environment,
+                observations.HashBudget(),
+                observations._path_replacements(environment),
+            )
+        rendered = json.dumps(
+            {"platform": platform_record, "runtime": runtime, "limitations": limitations},
+            sort_keys=True,
+        )
+        self.assertIn("internal environment is unavailable", rendered)
+        self.assertNotIn("must-not-be-recorded", rendered)
+        self.assertNotIn('"INCLUDE"', rendered)
+        self.assertNotIn('"LIB"', rendered)
+        self.assertNotIn("VCToolsInstallDir", rendered)
+
+    def test_rejects_unknown_target_and_relative_output(self) -> None:
+        with self.assertRaisesRegex(observations.ObservationError, "five-target"):
+            observations._safe_target("invented-target")
+        with self.assertRaisesRegex(observations.ObservationError, "must be absolute"):
+            observations.write_observation(Path("relative"), TARGET, {})
+
+
+if __name__ == "__main__":
+    unittest.main()
