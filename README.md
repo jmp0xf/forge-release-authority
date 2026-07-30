@@ -21,6 +21,10 @@ qualification, attestation, approval, publication, or withdrawal rules that judg
 The repository is being bootstrapped. It does not yet qualify, attest, tag, upload, or publish Forge releases. The
 first executable workflow will be added in a separate reviewed pull request.
 
+The verifier creates its predicate and subject-checksum outputs without overwriting existing paths. The two files are
+not a multi-file transaction: a filesystem race or late write failure can leave one sibling behind. Qualification runs
+must use a fresh private output directory, inspect any residue after failure, and rerun from a new empty directory.
+
 ## Security
 
 Do not disclose vulnerabilities in a public issue. Follow [SECURITY.md](SECURITY.md) to submit a private report.
