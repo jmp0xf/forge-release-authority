@@ -80,8 +80,11 @@ PATH_REPLACEMENTS = {
 }
 LOWER_GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(authorization|credential|password|secret|token)(\s*[:=]\s*)(\S+)"
+    r"(?im)(?P<prefix>\b(?:authorization|credentials?|passw(?:or)?d|secrets?|"
+    r"tokens?|api[_-]?key|access[_-]?key|client[_-]?secret|github[_-]?token|"
+    r"private[_-]?key)\b[ \t]*[:=][ \t]*)(?P<value>[^\n]*)"
 )
+URL_USERINFO = re.compile(r"(?i)\b(?P<scheme>https?://)[^/@\s]+@")
 
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_RETAINED_STREAM_BYTES = 4 * 1024
@@ -128,10 +131,24 @@ class HashBudget:
         if before.st_size > self.remaining:
             raise ObservationError("observation hashing exceeds its total byte limit")
 
-        digest = hashlib.sha256()
-        total = 0
+        open_flags = os.O_RDONLY
+        for optional_flag in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+            open_flags |= getattr(os, optional_flag, 0)
+
+        descriptor: int | None = None
         try:
-            with path.open("rb") as stream:
+            descriptor = os.open(path, open_flags)
+            stream = os.fdopen(descriptor, "rb")
+            descriptor = None
+            with stream:
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    raise ObservationError(f"{label} is not a regular file")
+                if _file_identity(before) != _file_identity(opened):
+                    raise ObservationError(f"{label} changed before it was opened")
+
+                digest = hashlib.sha256()
+                total = 0
                 while True:
                     chunk = stream.read(64 * 1024)
                     if not chunk:
@@ -140,29 +157,34 @@ class HashBudget:
                     if total > before.st_size or total > per_file_limit:
                         raise ObservationError(f"{label} changed or exceeded its byte limit")
                     digest.update(chunk)
+                opened_after = os.fstat(stream.fileno())
             after = path.stat(follow_symlinks=False)
         except ObservationError:
             raise
         except OSError as error:
             raise ObservationError(f"cannot hash {label}") from error
-        identity_before = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_size,
-            before.st_mtime_ns,
-        )
-        identity_after = (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_size,
-            after.st_mtime_ns,
-        )
-        if total != before.st_size or identity_before != identity_after:
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if (
+            total != before.st_size
+            or _file_identity(before) != _file_identity(opened_after)
+            or _file_identity(before) != _file_identity(after)
+        ):
             raise ObservationError(f"{label} changed while being hashed")
         self.remaining -= total
         return total, digest.hexdigest()
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _safe_git_sha(value: str, label: str) -> str:
@@ -202,7 +224,10 @@ def _redact_text(data: bytes, replacements: Sequence[tuple[str, str]]) -> tuple[
     for source, replacement in replacements:
         flags = re.IGNORECASE if os.name == "nt" else 0
         text = re.sub(re.escape(source), replacement, text, flags=flags)
-    text = SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
+    text = URL_USERINFO.sub(lambda match: f"{match.group('scheme')}<redacted>@", text)
+    text = SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group('prefix')}<redacted>", text
+    )
     return text, truncated
 
 
@@ -214,7 +239,48 @@ def _command_environment(environment: Mapping[str, str]) -> dict[str, str]:
     }
     result["LANG"] = "C"
     result["LC_ALL"] = "C"
+    if os.name == "nt":
+        result["NoDefaultCurrentDirectoryInExePath"] = "1"
     return result
+
+
+def _normalized_case_path(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
+
+
+def _is_within_path(path: str | os.PathLike[str], root: str | os.PathLike[str]) -> bool:
+    normalized_path = _normalized_case_path(path)
+    normalized_root = _normalized_case_path(root)
+    try:
+        return os.path.commonpath((normalized_path, normalized_root)) == normalized_root
+    except ValueError:
+        return False
+
+
+def _resolve_executable(
+    executable: str, environment: Mapping[str, str]
+) -> tuple[str | None, str | None]:
+    if os.path.isabs(executable):
+        return executable, None
+    path_value = environment.get("PATH")
+    resolved = shutil.which(executable, path=path_value)
+    if resolved is None:
+        return None, "not-found"
+    if not os.path.isabs(resolved):
+        return None, "refused-unsafe-search-result"
+
+    safe_directories = {
+        _normalized_case_path(entry)
+        for entry in (path_value or "").split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    }
+    resolved_parent = _normalized_case_path(Path(resolved).parent)
+    workspace = environment.get("GITHUB_WORKSPACE")
+    if resolved_parent not in safe_directories or (
+        workspace is not None and _is_within_path(resolved, workspace)
+    ):
+        return None, "refused-unsafe-search-result"
+    return resolved, None
 
 
 def _drain_stream(stream: BinaryIO, capture: _StreamCapture, limit_event: threading.Event) -> None:
@@ -247,12 +313,10 @@ def _run_command(
     if not argv or any("\0" in argument for argument in argv):
         raise ObservationError("internal observation command is invalid")
     executable = argv[0]
-    resolved = executable if os.path.isabs(executable) else shutil.which(
-        executable, path=environment.get("PATH")
-    )
+    resolved, resolution_error = _resolve_executable(executable, environment)
     displayed_argv = [_redact_text(item.encode(), replacements)[0] for item in argv]
     if resolved is None:
-        return {"argv": displayed_argv, "status": "not-found"}
+        return {"argv": displayed_argv, "status": resolution_error}
 
     stdout_capture = _StreamCapture(bytearray())
     stderr_capture = _StreamCapture(bytearray())
@@ -316,6 +380,8 @@ def _run_command(
 
     stdout, stdout_truncated = _redact_text(bytes(stdout_capture.retained), replacements)
     stderr, stderr_truncated = _redact_text(bytes(stderr_capture.retained), replacements)
+    stdout_truncated = stdout_truncated or stdout_capture.total > len(stdout_capture.retained)
+    stderr_truncated = stderr_truncated or stderr_capture.total > len(stderr_capture.retained)
     if retained_stdout is not None:
         retained_stdout.append(bytes(stdout_capture.retained))
     result: dict[str, Any] = {
@@ -407,9 +473,9 @@ def _executable_summary(
     budget: HashBudget,
     replacements: Sequence[tuple[str, str]],
 ) -> dict[str, Any]:
-    resolved = shutil.which(name, path=environment.get("PATH"))
+    resolved, resolution_error = _resolve_executable(name, environment)
     if resolved is None:
-        return {"status": "not-found"}
+        return {"status": resolution_error}
     return _file_summary(
         Path(resolved), budget, replacements, MAX_TOOL_BYTES, f"{name} executable", resolve=True
     )
@@ -456,14 +522,17 @@ def _directory_manifest(
         directory, depth = stack.pop()
         if depth > MAX_SCAN_DEPTH:
             raise ObservationError(f"{label} exceeds its directory depth limit")
+        entries: list[os.DirEntry[str]] = []
         try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            with os.scandir(directory) as iterator:
+                for entry in iterator:
+                    scanned += 1
+                    if scanned > MAX_SCAN_ENTRIES:
+                        raise ObservationError(f"{label} exceeds its scan entry limit")
+                    entries.append(entry)
         except OSError as error:
             raise ObservationError(f"cannot scan {label}") from error
-        scanned += len(entries)
-        if scanned > MAX_SCAN_ENTRIES:
-            raise ObservationError(f"{label} exceeds its scan entry limit")
-        for entry in entries:
+        for entry in sorted(entries, key=lambda item: item.name):
             path = Path(entry.path)
             try:
                 if entry.is_symlink():
@@ -593,8 +662,8 @@ def _platform_observation(
             require_absolute=False,
         )
         if musl_ld_path is not None and not musl_ld_path.is_absolute():
-            resolved_musl_ld = shutil.which(
-                os.fspath(musl_ld_path), path=environment.get("PATH")
+            resolved_musl_ld, _ = _resolve_executable(
+                os.fspath(musl_ld_path), environment
             )
             musl_ld_path = None if resolved_musl_ld is None else Path(resolved_musl_ld)
         commands = {
@@ -940,7 +1009,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except ObservationError as error:
         print(f"canary runner observation failed: {error}", file=sys.stderr)
         return 1
-    print(output)
+    print(f"wrote {output.name}")
     return 0
 
 
