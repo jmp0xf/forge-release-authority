@@ -21,10 +21,21 @@ qualification, attestation, approval, publication, or withdrawal rules that judg
 The repository is being bootstrapped. It does not yet qualify, attest, tag, upload, or publish Forge releases. The
 first executable workflow will be added in a separate reviewed pull request.
 
+The stable provenance identities are documented by the
+[Forge qualification build type](docs/build-types/qualify-v1.md) and the
+[protected GitHub Actions builder](docs/builders/github-actions-protected-v1.md). These contracts define how to
+interpret evidence; they do not by themselves establish a SLSA Build level. This repository claims no SLSA Build
+level until the complete platform and signer-builder pair have been independently assessed.
+
 The verifier creates its predicate and subject-checksum outputs without overwriting existing paths. The two files are
 not a multi-file transaction: a late write failure can leave one sibling behind. Qualification runs therefore require
 an initially empty output directory owned by the verifier user with mode `0700`, and no concurrent process running as
 that same user may modify it. Inspect any residue after failure and rerun from a new empty private directory.
+
+The production verifier accepts only finalized asset and builder-record directories plus the requested Forge commit.
+It derives the authority commit from an exact protected-main GitHub Actions context, reads policy from its own checkout,
+and resolves `Cargo.lock`, `THIRD-PARTY-LICENSES.txt`, policy, and verifier bytes through fixed GitHub repository IDs and
+commit/tree/blob objects. It has no path or commit option that can relabel arbitrary local bytes as trusted source.
 
 ## Security
 
