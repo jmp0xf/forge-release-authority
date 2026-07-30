@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from unittest import mock
 
 from scripts import write_canary_observation as observations
@@ -17,6 +19,29 @@ from scripts import write_canary_observation as observations
 SOURCE_COMMIT = "1" * 40
 AUTHORITY_COMMIT = "2" * 40
 TARGET = "x86_64-apple-darwin"
+
+
+def _stat_view(
+    source: os.stat_result,
+    *,
+    device: int | None = None,
+    inode: int | None = None,
+    mode: int | None = None,
+    size: int | None = None,
+    mtime_ns: int | None = None,
+    ctime_ns: int | None = None,
+) -> os.stat_result:
+    return cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=source.st_dev if device is None else device,
+            st_ino=source.st_ino if inode is None else inode,
+            st_mode=source.st_mode if mode is None else mode,
+            st_size=source.st_size if size is None else size,
+            st_mtime_ns=source.st_mtime_ns if mtime_ns is None else mtime_ns,
+            st_ctime_ns=source.st_ctime_ns if ctime_ns is None else ctime_ns,
+        ),
+    )
 
 
 class CanaryObservationTests(unittest.TestCase):
@@ -255,6 +280,112 @@ class CanaryObservationTests(unittest.TestCase):
             budget = observations.HashBudget(remaining=4)
             with self.assertRaisesRegex(observations.ObservationError, "total byte limit"):
                 budget.digest_regular_file(path, 1024, "large input")
+
+    def test_hash_budget_accepts_windows_path_and_descriptor_projections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "forge.exe"
+            content = b"native-binary"
+            path.write_bytes(content)
+            actual = path.stat()
+            path_view = _stat_view(
+                actual,
+                mode=actual.st_mode | 0o111,
+                ctime_ns=actual.st_ctime_ns + 1,
+            )
+            descriptor_view = _stat_view(
+                actual,
+                mode=actual.st_mode & ~0o111,
+                ctime_ns=actual.st_ctime_ns + 2,
+            )
+            budget = observations.HashBudget(remaining=1024)
+            with (
+                mock.patch.object(Path, "stat", side_effect=[path_view, path_view]),
+                mock.patch.object(os, "fstat", side_effect=[descriptor_view, descriptor_view]),
+            ):
+                size, digest = budget.digest_regular_file(path, 1024, "staged binary")
+
+        self.assertEqual(size, len(content))
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+        self.assertEqual(budget.remaining, 1024 - len(content))
+
+    def test_hash_budget_hashes_real_executable_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "forge.exe"
+            content = b"native-binary"
+            path.write_bytes(content)
+            metadata = path.stat()
+            os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+
+            size, digest = observations.HashBudget().digest_regular_file(
+                path, 1024, "staged binary"
+            )
+
+        self.assertEqual(size, len(content))
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+
+    def test_hash_budget_rejects_same_view_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "forge.exe"
+            path.write_bytes(b"native-binary")
+            actual = path.stat()
+            path_after = _stat_view(actual, ctime_ns=actual.st_ctime_ns + 1)
+            descriptor_after = _stat_view(actual, ctime_ns=actual.st_ctime_ns + 1)
+
+            with (
+                mock.patch.object(Path, "stat", side_effect=[actual, path_after]),
+                mock.patch.object(os, "fstat", side_effect=[actual, actual]),
+                self.assertRaisesRegex(observations.ObservationError, "changed while"),
+            ):
+                observations.HashBudget().digest_regular_file(
+                    path, 1024, "path-changing input"
+                )
+
+            with (
+                mock.patch.object(Path, "stat", side_effect=[actual, actual]),
+                mock.patch.object(os, "fstat", side_effect=[actual, descriptor_after]),
+                self.assertRaisesRegex(observations.ObservationError, "changed while"),
+            ):
+                observations.HashBudget().digest_regular_file(
+                    path, 1024, "descriptor-changing input"
+                )
+
+    def test_cross_view_snapshot_rejects_unknown_or_different_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "forge.exe"
+            path.write_bytes(b"native-binary")
+            actual = path.stat()
+
+        self.assertFalse(
+            observations._same_file_snapshot(actual, _stat_view(actual, inode=0))
+        )
+        self.assertFalse(
+            observations._same_file_snapshot(
+                actual, _stat_view(actual, inode=actual.st_ino + 1)
+            )
+        )
+
+    def test_build_observation_preserves_staged_binary_failure_reason(self) -> None:
+        with mock.patch.object(
+            observations,
+            "_file_summary",
+            return_value={
+                "reason": "staged binary changed before it was opened",
+                "status": "unavailable",
+            },
+        ):
+            with self.assertRaisesRegex(
+                observations.ObservationError,
+                "staged binary changed before it was opened",
+            ):
+                observations.build_observation(
+                    target=TARGET,
+                    source_commit=SOURCE_COMMIT,
+                    authority_commit=AUTHORITY_COMMIT,
+                    binary=Path("forge"),
+                    cargo_home=Path("cargo-home"),
+                    environment={},
+                    system="Darwin",
+                )
 
     def test_windows_probe_declares_internal_msvc_environment_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -144,7 +144,11 @@ class HashBudget:
                 opened = os.fstat(stream.fileno())
                 if not stat.S_ISREG(opened.st_mode):
                     raise ObservationError(f"{label} is not a regular file")
-                if _file_identity(before) != _file_identity(opened):
+                if opened.st_size < 0 or opened.st_size > per_file_limit:
+                    raise ObservationError(f"{label} exceeds its byte limit")
+                if opened.st_size > self.remaining:
+                    raise ObservationError("observation hashing exceeds its total byte limit")
+                if not _same_file_snapshot(before, opened):
                     raise ObservationError(f"{label} changed before it was opened")
 
                 digest = hashlib.sha256()
@@ -154,7 +158,7 @@ class HashBudget:
                     if not chunk:
                         break
                     total += len(chunk)
-                    if total > before.st_size or total > per_file_limit:
+                    if total > opened.st_size or total > per_file_limit:
                         raise ObservationError(f"{label} changed or exceeded its byte limit")
                     digest.update(chunk)
                 opened_after = os.fstat(stream.fileno())
@@ -167,9 +171,10 @@ class HashBudget:
             if descriptor is not None:
                 os.close(descriptor)
         if (
-            total != before.st_size
-            or _file_identity(before) != _file_identity(opened_after)
+            total != opened.st_size
             or _file_identity(before) != _file_identity(after)
+            or _file_identity(opened) != _file_identity(opened_after)
+            or not _same_file_snapshot(after, opened_after)
         ):
             raise ObservationError(f"{label} changed while being hashed")
         self.remaining -= total
@@ -184,6 +189,27 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, i
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
+    )
+
+
+def _same_file_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    """Bind path and descriptor views without comparing platform projections.
+
+    Windows path stat and descriptor stat intentionally expose different mode and
+    ctime projections. Complete metadata is still compared within each view.
+    """
+    if (
+        left.st_dev == 0
+        or left.st_ino == 0
+        or right.st_dev == 0
+        or right.st_ino == 0
+    ):
+        return False
+    return (
+        os.path.samestat(left, right)
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
     )
 
 
@@ -890,7 +916,11 @@ def build_observation(
         resolve=False,
     )
     if binary_summary.get("status") != "observed":
-        raise ObservationError("staged binary could not be observed as a bounded regular file")
+        reason = binary_summary.get("reason")
+        detail = f": {reason}" if isinstance(reason, str) else ""
+        raise ObservationError(
+            f"staged binary could not be observed as a bounded regular file{detail}"
+        )
     tools, target_libdir_path = _tool_observations(
         target, environment, budget, replacements
     )
