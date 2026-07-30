@@ -11,6 +11,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scripts import verify_release as verifier
 
@@ -530,24 +531,301 @@ class VerifyReleaseTests(unittest.TestCase):
         self.assertRegex(
             FORGE_SBOM_GRAPH_DERIVATION_RECEIPT["forgeCommit"], r"^[0-9a-f]{40}$"
         )
+        self.assertEqual(
+            policy["limits"],
+            {
+                "binaryBytes": 67_108_864,
+                "cargoLockBytes": 1_048_576,
+                "sbomBytes": 2_097_152,
+                "noticeBytes": 8_388_608,
+                "manifestBytes": 65_536,
+                "checksumsBytes": 16_384,
+                "builderRecordBytes": 65_536,
+                "totalAssetBytes": 201_326_592,
+                "totalBuilderRecordBytes": 262_144,
+            },
+        )
 
     def test_policy_requires_a_bounded_exact_sbom_graph_contract(self) -> None:
         policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
-        for name in ("missing", "zero-count", "zero-edges", "malformed-digest"):
+        for name in (
+            "missing",
+            "zero-count",
+            "over-count",
+            "zero-edges",
+            "over-edges",
+            "malformed-digest",
+            "missing-total",
+        ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 candidate = json.loads(json.dumps(policy))
                 if name == "missing":
                     del candidate["targets"][0]["sbomGraph"]
                 elif name == "zero-count":
                     candidate["targets"][0]["sbomGraph"]["componentCount"] = 0
+                elif name == "over-count":
+                    candidate["targets"][0]["sbomGraph"]["componentCount"] = (
+                        verifier.MAX_SBOM_COMPONENTS + 1
+                    )
                 elif name == "zero-edges":
                     candidate["targets"][0]["sbomGraph"]["dependencyEdgeCount"] = 0
-                else:
+                elif name == "over-edges":
+                    candidate["targets"][0]["sbomGraph"]["dependencyEdgeCount"] = (
+                        verifier.MAX_SBOM_DEPENDENCY_EDGES + 1
+                    )
+                elif name == "malformed-digest":
                     candidate["targets"][0]["sbomGraph"]["canonicalSha256"] = "A" * 64
+                else:
+                    del candidate["limits"]["totalAssetBytes"]
                 path = Path(directory) / "policy.json"
                 path.write_bytes(json_bytes(candidate))
                 with self.assertRaises(verifier.VerificationError):
                     verifier.load_policy(path)
+
+    def test_secure_posix_capabilities_fail_closed(self) -> None:
+        with mock.patch.object(os, "name", "nt"):
+            with self.assertRaisesRegex(verifier.VerificationError, "POSIX"):
+                verifier._require_secure_posix_fs_capabilities()
+        with mock.patch.object(os, "O_NOFOLLOW", 0):
+            with self.assertRaisesRegex(verifier.VerificationError, "O_NOFOLLOW"):
+                verifier._require_secure_posix_fs_capabilities()
+        with mock.patch.object(os, "supports_dir_fd", set()):
+            with self.assertRaisesRegex(verifier.VerificationError, r"open\(dir_fd\)"):
+                verifier._require_secure_posix_fs_capabilities()
+        with mock.patch.object(os, "supports_follow_symlinks", set()):
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "follow_symlinks=False"
+            ):
+                verifier._require_secure_posix_fs_capabilities()
+        with mock.patch.object(os, "supports_fd", set()):
+            with self.assertRaisesRegex(verifier.VerificationError, r"scandir\(fd\)"):
+                verifier._require_secure_posix_fs_capabilities()
+        with mock.patch.object(os, "geteuid", None):
+            with self.assertRaisesRegex(verifier.VerificationError, "geteuid"):
+                verifier._require_secure_posix_fs_capabilities()
+
+    def test_json_integer_and_directory_enumeration_work_are_bounded(self) -> None:
+        with self.assertRaisesRegex(verifier.VerificationError, "integer exceeds"):
+            verifier._load_json_bytes(
+                b'{"value":' + b"9" * 65 + b"}", "oversized integer fixture"
+            )
+
+        class EndlessEntries:
+            def __init__(self) -> None:
+                self.count = 0
+
+            def __enter__(self) -> EndlessEntries:
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def __iter__(self) -> EndlessEntries:
+                return self
+
+            def __next__(self) -> Any:
+                self.count += 1
+                return type("Entry", (), {"name": f"entry-{self.count}"})()
+
+        entries = EndlessEntries()
+        with mock.patch.object(os, "scandir", return_value=entries):
+            with self.assertRaisesRegex(verifier.VerificationError, "more than 2"):
+                verifier._bounded_directory_names(123, 2, "oversized directory")
+        self.assertEqual(entries.count, 3)
+
+    def test_exact_directory_enforces_cumulative_byte_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a").write_bytes(b"aaaaaa")
+            (root / "b").write_bytes(b"bbbbbb")
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "remaining directory total limit"
+            ):
+                verifier._read_exact_directory(
+                    root,
+                    ["a", "b"],
+                    lambda _name: 6,
+                    11,
+                    "budget fixture",
+                )
+            self.assertEqual(
+                verifier._read_exact_directory(
+                    root,
+                    ["a", "b"],
+                    lambda _name: 6,
+                    12,
+                    "budget fixture",
+                ),
+                {"a": b"aaaaaa", "b": b"bbbbbb"},
+            )
+
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(os, "read", return_value=b"1234567"):
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError,
+                        "remaining directory total limit",
+                    ):
+                        verifier._read_regular_file_at(
+                            directory_fd,
+                            "a",
+                            64,
+                            6,
+                            "growing budget fixture/a",
+                        )
+            finally:
+                os.close(directory_fd)
+
+    def test_directory_and_entry_identities_are_stable_end_to_end(self) -> None:
+        with self.subTest("directory changes between lstat and open"):
+            with tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                root = parent / "input"
+                moved = parent / "moved-input"
+                root.mkdir()
+                (root / "item").write_bytes(b"original")
+                real_open = os.open
+                swapped = False
+
+                def swap_directory_open(
+                    path: Any,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal swapped
+                    if not swapped and path == root.name and dir_fd is not None:
+                        swapped = True
+                        root.rename(moved)
+                        root.mkdir()
+                        (root / "item").write_bytes(b"replacement")
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                with mock.patch.object(
+                    verifier, "_require_secure_posix_fs_capabilities"
+                ), mock.patch.object(os, "open", side_effect=swap_directory_open):
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError, "directory changed before"
+                    ):
+                        verifier._read_exact_directory(
+                            root,
+                            ["item"],
+                            lambda _name: 64,
+                            64,
+                            "identity fixture",
+                        )
+
+        with self.subTest("entry changes between visible stat and open"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                item = root / "item"
+                moved = root / "moved"
+                item.write_bytes(b"original")
+                real_open = os.open
+                swapped = False
+
+                def swap_entry_open(
+                    path: Any,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal swapped
+                    if not swapped and path == "item" and dir_fd is not None:
+                        swapped = True
+                        item.rename(moved)
+                        item.write_bytes(b"replacement")
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                with mock.patch.object(
+                    verifier, "_require_secure_posix_fs_capabilities"
+                ), mock.patch.object(os, "open", side_effect=swap_entry_open):
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError, "changed before it was opened"
+                    ):
+                        verifier._read_exact_directory(
+                            root,
+                            ["item"],
+                            lambda _name: 64,
+                            64,
+                            "identity fixture",
+                        )
+
+        with self.subTest("entry changes after its read"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                item = root / "item"
+                item.write_bytes(b"original")
+                real_reader = verifier._read_regular_file_at
+
+                def replace_after_read(
+                    directory_fd: int,
+                    name: str,
+                    limit: int,
+                    remaining_total: int,
+                    label: str,
+                ) -> tuple[bytes, verifier.StatIdentity]:
+                    result = real_reader(
+                        directory_fd, name, limit, remaining_total, label
+                    )
+                    item.unlink()
+                    item.write_bytes(b"replaced")
+                    return result
+
+                with mock.patch.object(
+                    verifier,
+                    "_read_regular_file_at",
+                    side_effect=replace_after_read,
+                ):
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError, "changed after it was read"
+                    ):
+                        verifier._read_exact_directory(
+                            root,
+                            ["item"],
+                            lambda _name: 64,
+                            64,
+                            "identity fixture",
+                        )
+
+        with self.subTest("directory changes after its entries are read"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "item").write_bytes(b"original")
+                real_reader = verifier._read_regular_file_at
+
+                def mutate_directory_after_read(
+                    directory_fd: int,
+                    name: str,
+                    limit: int,
+                    remaining_total: int,
+                    label: str,
+                ) -> tuple[bytes, verifier.StatIdentity]:
+                    result = real_reader(
+                        directory_fd, name, limit, remaining_total, label
+                    )
+                    transient = root / "transient"
+                    transient.write_bytes(b"change")
+                    transient.unlink()
+                    return result
+
+                with mock.patch.object(
+                    verifier,
+                    "_read_regular_file_at",
+                    side_effect=mutate_directory_after_read,
+                ):
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError, "directory changed during"
+                    ):
+                        verifier._read_exact_directory(
+                            root,
+                            ["item"],
+                            lambda _name: 64,
+                            64,
+                            "identity fixture",
+                        )
 
     def test_canonical_projection_receipt_binds_refs_fields_and_root_edges(
         self,
@@ -701,6 +979,26 @@ class VerifyReleaseTests(unittest.TestCase):
                 verifier.VerificationError, "canonical bom-ref and semantic graph"
             ):
                 fixture.verify()
+
+    def test_sbom_rejects_dependency_edges_at_the_runtime_complexity_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            target = fixture.policy["targets"][0]
+            binary = (fixture.assets / target["binary"]).read_bytes()
+            sbom = (fixture.assets / target["sbom"]).read_bytes()
+            lock_packages = verifier._parse_trusted_cargo_lock(LOCK_BYTES)
+            with mock.patch.object(verifier, "MAX_SBOM_DEPENDENCY_EDGES", 0):
+                with self.assertRaisesRegex(
+                    verifier.VerificationError, "edge complexity limit"
+                ):
+                    verifier._validate_sbom(
+                        fixture.policy,
+                        target,
+                        sbom,
+                        binary,
+                        FORGE_COMMIT,
+                        lock_packages,
+                    )
 
     def test_rejects_missing_extra_casefold_collision_symlink_and_nonregular(
         self,
@@ -933,11 +1231,79 @@ class VerifyReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.VerificationError, "executable PE32"):
             verifier._validate_binary_structure(pe_target, bytes(dll_image))
 
+    def test_binary_parsers_enforce_conservative_structure_caps(self) -> None:
+        self.assertEqual(verifier.MAX_ELF_PROGRAM_HEADERS, 128)
+        self.assertEqual(verifier.MAX_ELF_DYNAMIC_TABLE_BYTES, 1_048_576)
+        self.assertEqual(verifier.MAX_MACHO_LOAD_COMMANDS, 256)
+        self.assertEqual(verifier.MAX_MACHO_LOAD_COMMAND_BYTES, 1_048_576)
+        self.assertEqual(verifier.MAX_PE_SECTIONS, 96)
+        self.assertEqual(verifier.MAX_SBOM_COMPONENTS, 512)
+        self.assertEqual(verifier.MAX_SBOM_DEPENDENCY_EDGES, 4_096)
+
+        policy, _ = verifier.load_policy(POLICY_PATH)
+        elf_target = policy["targets"][0]
+        excessive_elf_headers = bytearray(
+            synthetic_executable(elf_target["binaryFormat"])
+        )
+        struct.pack_into(
+            "<H",
+            excessive_elf_headers,
+            56,
+            verifier.MAX_ELF_PROGRAM_HEADERS + 1,
+        )
+        with self.assertRaisesRegex(verifier.VerificationError, "ELF complexity"):
+            verifier._validate_binary_structure(
+                elf_target, bytes(excessive_elf_headers)
+            )
+
+        dynamic_elf = bytearray(synthetic_executable(elf_target["binaryFormat"]))
+        dynamic_elf.extend(b"\0" * (240 - len(dynamic_elf)))
+        struct.pack_into("<H", dynamic_elf, 56, 2)
+        struct.pack_into("<II", dynamic_elf, 120, 2, 4)  # PT_DYNAMIC
+        struct.pack_into("<Q", dynamic_elf, 128, 208)
+        struct.pack_into("<Q", dynamic_elf, 152, 32)
+        struct.pack_into("<Q", dynamic_elf, 160, 32)
+        with mock.patch.object(verifier, "MAX_ELF_DYNAMIC_TABLE_BYTES", 16):
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "dynamic-table complexity"
+            ):
+                verifier._validate_binary_structure(elf_target, bytes(dynamic_elf))
+
+        macho_target = policy["targets"][2]
+        excessive_macho_commands = bytearray(
+            synthetic_executable(macho_target["binaryFormat"])
+        )
+        struct.pack_into(
+            "<I",
+            excessive_macho_commands,
+            16,
+            verifier.MAX_MACHO_LOAD_COMMANDS + 1,
+        )
+        with self.assertRaisesRegex(verifier.VerificationError, "Mach-O.*complexity"):
+            verifier._validate_binary_structure(
+                macho_target, bytes(excessive_macho_commands)
+            )
+
+        pe_target = policy["targets"][4]
+        excessive_pe_sections = bytearray(
+            synthetic_executable(pe_target["binaryFormat"])
+        )
+        struct.pack_into(
+            "<H",
+            excessive_pe_sections,
+            0x46,
+            verifier.MAX_PE_SECTIONS + 1,
+        )
+        with self.assertRaisesRegex(verifier.VerificationError, "section PE limit"):
+            verifier._validate_binary_structure(pe_target, bytes(excessive_pe_sections))
+
     def test_cli_writes_predicate_create_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory, structured_binaries=True)
-            output = Path(directory) / "predicate.json"
-            subject_checksums = Path(directory) / "subject-checksums.txt"
+            output_directory = Path(directory) / "outputs"
+            output_directory.mkdir(mode=0o700)
+            output = output_directory / "predicate.json"
+            subject_checksums = output_directory / "subject-checksums.txt"
             arguments = [
                 "--policy",
                 str(fixture.policy_path),
@@ -996,12 +1362,315 @@ class VerifyReleaseTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(verifier.main(colliding_outputs), 1)
             self.assertFalse(same_output.exists())
+            unrelated = output_directory / "unrelated"
+            unrelated.write_text("occupied\n", encoding="utf-8")
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(verifier.main(arguments), 1)
+            self.assertFalse(output.exists())
+            self.assertFalse(subject_checksums.exists())
+            unrelated.unlink()
+            output_directory.chmod(0o755)
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(verifier.main(arguments), 1)
+            output_directory.chmod(0o700)
             inside_inputs = list(arguments)
             inside_inputs[inside_inputs.index(str(output))] = str(
                 fixture.assets / "predicate.json"
             )
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(verifier.main(inside_inputs), 1)
+
+    def test_cli_binds_actual_input_and_output_directory_inodes(self) -> None:
+        with self.subTest("input ancestor changes after pin"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                safe = root / "safe"
+                safe.mkdir()
+                fixture = self.fixture(str(safe), structured_binaries=True)
+                alias = root / "input-alias"
+                alias.symlink_to(safe, target_is_directory=True)
+                replacement = root / "replacement"
+                (replacement / "assets").mkdir(parents=True)
+                output_directory = root / "outputs"
+                output_directory.mkdir(mode=0o700)
+                predicate = output_directory / "predicate.json"
+                checksums = output_directory / "subject-checksums.txt"
+                arguments = [
+                    "--policy",
+                    str(fixture.policy_path),
+                    "--assets",
+                    str(alias / "assets"),
+                    "--builder-records",
+                    str(fixture.records),
+                    "--cargo-lock",
+                    str(fixture.cargo_lock),
+                    "--source-license-notices",
+                    str(fixture.source_license_notices),
+                    "--forge-commit",
+                    FORGE_COMMIT,
+                    "--authority-commit",
+                    AUTHORITY_COMMIT,
+                    "--predicate-out",
+                    str(predicate),
+                    "--subject-checksums-out",
+                    str(checksums),
+                ]
+                real_verify = verifier._verify_release_with_pinned_directories
+
+                def swap_input_ancestor(*args: Any, **kwargs: Any) -> Any:
+                    alias.unlink()
+                    alias.symlink_to(replacement, target_is_directory=True)
+                    return real_verify(*args, **kwargs)
+
+                with mock.patch.object(
+                    verifier,
+                    "_verify_release_with_pinned_directories",
+                    side_effect=swap_input_ancestor,
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(verifier.main(arguments), 1)
+                self.assertFalse(predicate.exists())
+                self.assertFalse(checksums.exists())
+
+        with self.subTest("canonical output ancestor changes before secure open"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                inputs = root / "inputs"
+                (inputs / "leaf").mkdir(parents=True)
+                output_ancestor = root / "output"
+                (output_ancestor / "leaf").mkdir(parents=True)
+                detached = root / "detached-output"
+                pinned_input = verifier._pin_directory(inputs, "test input")
+                real_open = verifier._open_resolved_directory
+                expected_resolved = (output_ancestor / "leaf").resolve()
+                swapped = False
+
+                def swap_before_component_open(path: Path, label: str) -> int:
+                    nonlocal swapped
+                    if not swapped and path == expected_resolved:
+                        swapped = True
+                        output_ancestor.rename(detached)
+                        output_ancestor.symlink_to(inputs, target_is_directory=True)
+                    return real_open(path, label)
+
+                try:
+                    with mock.patch.object(
+                        verifier,
+                        "_open_resolved_directory",
+                        side_effect=swap_before_component_open,
+                    ):
+                        with self.assertRaises(verifier.VerificationError):
+                            verifier._pin_output(
+                                output_ancestor / "leaf" / "predicate.json",
+                                [pinned_input],
+                            )
+                finally:
+                    verifier._close_pinned_directory(pinned_input)
+                self.assertTrue(swapped)
+                self.assertFalse((inputs / "leaf" / "predicate.json").exists())
+
+    def test_cli_rechecks_both_created_outputs_before_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.fixture(directory, structured_binaries=True)
+            output_directory = root / "outputs"
+            output_directory.mkdir(mode=0o700)
+            predicate = output_directory / "predicate.json"
+            checksums = output_directory / "subject-checksums.txt"
+            arguments = [
+                "--policy",
+                str(fixture.policy_path),
+                "--assets",
+                str(fixture.assets),
+                "--builder-records",
+                str(fixture.records),
+                "--cargo-lock",
+                str(fixture.cargo_lock),
+                "--source-license-notices",
+                str(fixture.source_license_notices),
+                "--forge-commit",
+                FORGE_COMMIT,
+                "--authority-commit",
+                AUTHORITY_COMMIT,
+                "--predicate-out",
+                str(predicate),
+                "--subject-checksums-out",
+                str(checksums),
+            ]
+            real_write = verifier._write_create_only
+            created: list[verifier._CreatedOutput] = []
+
+            def tamper_first_during_second_write(
+                output: verifier._PinnedOutput, data: bytes
+            ) -> verifier._CreatedOutput:
+                result = real_write(output, data)
+                if created:
+                    os.lseek(created[0].file_fd, 0, os.SEEK_SET)
+                    os.write(created[0].file_fd, b"X")
+                    os.fsync(created[0].file_fd)
+                created.append(result)
+                return result
+
+            with mock.patch.object(
+                verifier,
+                "_write_create_only",
+                side_effect=tamper_first_during_second_write,
+            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(verifier.main(arguments), 1)
+            self.assertTrue(predicate.exists())
+            self.assertTrue(checksums.read_bytes().startswith(b"X"))
+
+    def test_created_output_growth_is_rejected_before_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "outputs"
+            output_directory.mkdir(mode=0o700)
+            pinned = verifier._pin_output(output_directory / "result", [])
+            created = verifier._write_create_only(pinned, b"ok")
+            try:
+                os.ftruncate(created.file_fd, 32 * 1024 * 1024)
+                with mock.patch.object(
+                    os,
+                    "read",
+                    side_effect=AssertionError("readback must remain bounded"),
+                ):
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError, "changed before completion"
+                    ):
+                        verifier._require_created_outputs_stable([created])
+            finally:
+                os.close(created.file_fd)
+                os.close(pinned.directory_fd)
+
+    def test_cli_pins_output_parents_and_rejects_boundary_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.fixture(directory, structured_binaries=True)
+
+            def arguments(predicate: Path, checksums: Path) -> list[str]:
+                return [
+                    "--policy",
+                    str(fixture.policy_path),
+                    "--assets",
+                    str(fixture.assets),
+                    "--builder-records",
+                    str(fixture.records),
+                    "--cargo-lock",
+                    str(fixture.cargo_lock),
+                    "--source-license-notices",
+                    str(fixture.source_license_notices),
+                    "--forge-commit",
+                    FORGE_COMMIT,
+                    "--authority-commit",
+                    AUTHORITY_COMMIT,
+                    "--predicate-out",
+                    str(predicate),
+                    "--subject-checksums-out",
+                    str(checksums),
+                ]
+
+            descendant = fixture.assets / "nested"
+            descendant.mkdir()
+            descendant_predicate = descendant / "predicate.json"
+            safe_output_directory = root / "safe-outputs"
+            safe_output_directory.mkdir(mode=0o700)
+            safe_checksums = safe_output_directory / "safe-checksums.txt"
+            with mock.patch.object(
+                verifier, "_verify_release_with_pinned_directories"
+            ) as verify_mock, redirect_stdout(io.StringIO()), redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(
+                    verifier.main(arguments(descendant_predicate, safe_checksums)), 1
+                )
+            verify_mock.assert_not_called()
+            self.assertFalse(descendant_predicate.exists())
+            self.assertFalse(safe_checksums.exists())
+
+            casefold_predicate = root / "Qualification.json"
+            casefold_checksums = root / "qualification.JSON"
+            with mock.patch.object(
+                verifier, "_verify_release_with_pinned_directories"
+            ) as verify_mock, redirect_stdout(io.StringIO()), redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(
+                    verifier.main(arguments(casefold_predicate, casefold_checksums)), 1
+                )
+            verify_mock.assert_not_called()
+            self.assertFalse(casefold_predicate.exists())
+            self.assertFalse(casefold_checksums.exists())
+
+            symlink_parent = root / "output-link"
+            symlink_parent.symlink_to(root, target_is_directory=True)
+            with mock.patch.object(
+                verifier, "_verify_release_with_pinned_directories"
+            ) as verify_mock, redirect_stdout(io.StringIO()), redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(
+                    verifier.main(
+                        arguments(
+                            symlink_parent / "predicate.json",
+                            symlink_parent / "checksums.txt",
+                        )
+                    ),
+                    1,
+                )
+            verify_mock.assert_not_called()
+            self.assertFalse((root / "predicate.json").exists())
+            self.assertFalse((root / "checksums.txt").exists())
+
+            safe_parent = root / "safe-parent"
+            safe_nested = safe_parent / "nested"
+            safe_nested.mkdir(parents=True)
+            safe_nested.chmod(0o700)
+            alias = root / "output-alias"
+            alias.symlink_to(safe_parent, target_is_directory=True)
+            aliased_predicate = alias / "nested" / "predicate.json"
+
+            def swap_output_ancestor(
+                *_args: Any, **_kwargs: Any
+            ) -> tuple[dict[str, Any], bytes]:
+                alias.unlink()
+                alias.symlink_to(fixture.assets, target_is_directory=True)
+                return {}, b"synthetic checksums\n"
+
+            with mock.patch.object(
+                verifier,
+                "_verify_release_with_pinned_directories",
+                side_effect=swap_output_ancestor,
+            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    verifier.main(arguments(aliased_predicate, safe_checksums)), 1
+                )
+            self.assertFalse((safe_nested / aliased_predicate.name).exists())
+            self.assertFalse(
+                (fixture.assets / "nested" / aliased_predicate.name).exists()
+            )
+            self.assertFalse(safe_checksums.exists())
+
+            output_directory = root / "outputs"
+            detached_directory = root / "detached-outputs"
+            output_directory.mkdir(mode=0o700)
+            predicate = output_directory / "predicate.json"
+            checksums = output_directory / "subject-checksums.txt"
+
+            def swap_output_parent(
+                *_args: Any, **_kwargs: Any
+            ) -> tuple[dict[str, Any], bytes]:
+                output_directory.rename(detached_directory)
+                output_directory.symlink_to(fixture.assets, target_is_directory=True)
+                return {}, b"synthetic checksums\n"
+
+            with mock.patch.object(
+                verifier,
+                "_verify_release_with_pinned_directories",
+                side_effect=swap_output_parent,
+            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(verifier.main(arguments(predicate, checksums)), 1)
+            self.assertFalse((detached_directory / predicate.name).exists())
+            self.assertFalse((detached_directory / checksums.name).exists())
+            self.assertFalse((fixture.assets / predicate.name).exists())
+            self.assertFalse((fixture.assets / checksums.name).exists())
 
 
 if __name__ == "__main__":

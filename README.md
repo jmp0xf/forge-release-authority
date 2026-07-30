@@ -22,8 +22,9 @@ The repository is being bootstrapped. It does not yet qualify, attest, tag, uplo
 first executable workflow will be added in a separate reviewed pull request.
 
 The verifier creates its predicate and subject-checksum outputs without overwriting existing paths. The two files are
-not a multi-file transaction: a filesystem race or late write failure can leave one sibling behind. Qualification runs
-must use a fresh private output directory, inspect any residue after failure, and rerun from a new empty directory.
+not a multi-file transaction: a late write failure can leave one sibling behind. Qualification runs therefore require
+an initially empty output directory owned by the verifier user with mode `0700`, and no concurrent process running as
+that same user may modify it. Inspect any residue after failure and rerun from a new empty private directory.
 
 ## Security
 
