@@ -1,0 +1,135 @@
+{
+  "schema": "forge.release-authority-policy/v1",
+  "source": {
+    "owner": "jmp0xf",
+    "repository": "forge",
+    "ownerId": 2247932,
+    "repositoryId": 1312750430
+  },
+  "authority": {
+    "owner": "jmp0xf",
+    "repository": "forge-release-authority",
+    "ownerId": 2247932,
+    "repositoryId": 1317240187,
+    "oidcIssuer": "https://token.actions.githubusercontent.com",
+    "oidcSubjectPrefix": "repo:jmp0xf@2247932/forge-release-authority@1317240187",
+    "environment": "forge-release"
+  },
+  "release": {
+    "version": "0.1.0-rc.2",
+    "tag": "v0.1.0-rc.2",
+    "manifestSchema": "forge.release-manifest/v2",
+    "artifactCount": 11,
+    "subjectCount": 13,
+    "checksumLineCount": 12,
+    "binaryStructureCheckRequired": true,
+    "notice": {
+      "name": "THIRD-PARTY-LICENSES.txt",
+      "target": "all"
+    },
+    "assets": [
+      "SHA256SUMS",
+      "THIRD-PARTY-LICENSES.txt",
+      "forge-0.1.0-rc.2-aarch64-apple-darwin",
+      "forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json",
+      "forge-0.1.0-rc.2-aarch64-unknown-linux-musl",
+      "forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json",
+      "forge-0.1.0-rc.2-x86_64-apple-darwin",
+      "forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json",
+      "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe",
+      "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json",
+      "forge-0.1.0-rc.2-x86_64-unknown-linux-musl",
+      "forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json",
+      "release-manifest.json"
+    ]
+  },
+  "toolchain": {
+    "rust": "1.96.0"
+  },
+  "projectLicenseExpression": "MIT OR Apache-2.0",
+  "targets": [
+    {
+      "triple": "x86_64-unknown-linux-musl",
+      "runnerLabel": "ubuntu-24.04",
+      "binaryFormat": "elf64-x86_64-static",
+      "binary": "forge-0.1.0-rc.2-x86_64-unknown-linux-musl",
+      "sbom": "forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json",
+      "sbomGraph": {
+        "componentCount": 86,
+        "dependencyEdgeCount": 151,
+        "canonicalSha256": "a02a644a2cdc7b46da1b771828cd7fe4b1a76fb2fb58448f7ceec0fdefccdb55"
+      },
+      "builderRecord": "builder-record-x86_64-unknown-linux-musl.json"
+    },
+    {
+      "triple": "aarch64-unknown-linux-musl",
+      "runnerLabel": "ubuntu-24.04-arm",
+      "binaryFormat": "elf64-aarch64-static",
+      "binary": "forge-0.1.0-rc.2-aarch64-unknown-linux-musl",
+      "sbom": "forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json",
+      "sbomGraph": {
+        "componentCount": 85,
+        "dependencyEdgeCount": 150,
+        "canonicalSha256": "dbd12b827e48d6a61931850e00ac5dcc24b85a05be2986e4df99b5c5ccd4627e"
+      },
+      "builderRecord": "builder-record-aarch64-unknown-linux-musl.json"
+    },
+    {
+      "triple": "x86_64-apple-darwin",
+      "runnerLabel": "macos-15-intel",
+      "binaryFormat": "macho64-x86_64",
+      "binary": "forge-0.1.0-rc.2-x86_64-apple-darwin",
+      "sbom": "forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json",
+      "sbomGraph": {
+        "componentCount": 86,
+        "dependencyEdgeCount": 153,
+        "canonicalSha256": "241662b88242609b7c5b6c2d6a02a9114aa26f01d517709b0f00e30efddc7189"
+      },
+      "builderRecord": "builder-record-x86_64-apple-darwin.json"
+    },
+    {
+      "triple": "aarch64-apple-darwin",
+      "runnerLabel": "macos-15",
+      "binaryFormat": "macho64-aarch64",
+      "binary": "forge-0.1.0-rc.2-aarch64-apple-darwin",
+      "sbom": "forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json",
+      "sbomGraph": {
+        "componentCount": 85,
+        "dependencyEdgeCount": 152,
+        "canonicalSha256": "d5e37c125fde43d27e8d21736a0793b215a3bb5bc9d9b216c8cc2bdcfffb6469"
+      },
+      "builderRecord": "builder-record-aarch64-apple-darwin.json"
+    },
+    {
+      "triple": "x86_64-pc-windows-msvc",
+      "runnerLabel": "windows-2025",
+      "binaryFormat": "pe64-x86_64",
+      "binary": "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe",
+      "sbom": "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json",
+      "sbomGraph": {
+        "componentCount": 88,
+        "dependencyEdgeCount": 152,
+        "canonicalSha256": "337ad1adef86fe3def7f4ec02a5cb2f539426a2f6e5a41aaf7eac29d182146f2"
+      },
+      "builderRecord": "builder-record-x86_64-pc-windows-msvc.json"
+    }
+  ],
+  "builderRecords": {
+    "schema": "forge.release-authority-builder-record/v1",
+    "count": 5
+  },
+  "provenance": {
+    "predicateType": "https://slsa.dev/provenance/v1",
+    "buildType": "https://github.com/jmp0xf/forge-release-authority/qualify/v1",
+    "workflowRef": "https://github.com/jmp0xf/forge-release-authority/.github/workflows/qualify.yml@refs/heads/main"
+  },
+  "limits": {
+    "binaryBytes": 268435456,
+    "cargoLockBytes": 1048576,
+    "sbomBytes": 33554432,
+    "noticeBytes": 33554432,
+    "manifestBytes": 1048576,
+    "checksumsBytes": 1048576,
+    "builderRecordBytes": 1048576
+  }
+}
