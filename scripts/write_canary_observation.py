@@ -80,9 +80,9 @@ PATH_REPLACEMENTS = {
 }
 LOWER_GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 SECRET_ASSIGNMENT = re.compile(
-    r"(?im)(?P<prefix>\b(?:authorization|credentials?|passw(?:or)?d|secrets?|"
-    r"tokens?|api[_-]?key|access[_-]?key|client[_-]?secret|github[_-]?token|"
-    r"private[_-]?key)\b[ \t]*[:=][ \t]*)(?P<value>[^\n]*)"
+    r"(?im)(?P<prefix>\b(?:[a-z0-9]+[_-])*(?:authorization|credentials?|"
+    r"passw(?:or)?d|secrets?|tokens?|api[_-]?key|access[_-]?key|private[_-]?key)"
+    r"(?:[_-][a-z0-9]+)*\b[ \t]*[:=][ \t]*)(?P<value>[^\n]*)"
 )
 URL_USERINFO = re.compile(r"(?i)\b(?P<scheme>https?://)[^/@\s]+@")
 
