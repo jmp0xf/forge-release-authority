@@ -147,6 +147,60 @@ class QualifyWorkflowTests(unittest.TestCase):
         for index, block in enumerate(python_blocks, start=1):
             compile(textwrap.dedent(block), f"qualify.yml Python block {index}", "exec")
 
+    def test_native_jobs_install_complete_toolchain_and_keep_source_gates(self) -> None:
+        workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        native = _job_blocks(workflow)["native-build"]
+        unix_install = _step_block(native, "Install exact Rust toolchain")
+        windows_install = _step_block(
+            native, "Install exact Rust toolchain on Windows"
+        )
+        unix_build = _step_block(native, "Check, test, and stage native assets")
+        windows_build = _step_block(
+            native, "Check, test, and stage native assets on Windows"
+        )
+
+        rust_version = policy["toolchain"]["rust"]
+        self.assertEqual(workflow.count(f"  RUSTUP_TOOLCHAIN: {rust_version}\n"), 1)
+        self.assertLess(
+            native.index("      - name: Install exact Rust toolchain\n"),
+            native.index("      - name: Check, test, and stage native assets\n"),
+        )
+        self.assertLess(
+            native.index("      - name: Install exact Rust toolchain on Windows\n"),
+            native.index(
+                "      - name: Check, test, and stage native assets on Windows\n"
+            ),
+        )
+
+        for block in (unix_install, windows_install):
+            self.assertEqual(block.count("--component clippy"), 1)
+            self.assertEqual(block.count("--component rustfmt"), 1)
+            self.assertEqual(block.count("cargo clippy --version"), 1)
+            self.assertEqual(block.count("cargo fmt --version"), 1)
+
+        expected_tests = {
+            "unix": (
+                unix_build,
+                'cargo test --locked --offline --workspace --target "$TARGET" '
+                "--no-fail-fast",
+            ),
+            "windows": (
+                windows_build,
+                "cargo test --locked --offline --workspace --target $env:TARGET "
+                "--no-fail-fast",
+            ),
+        }
+        for platform, (block, test_command) in expected_tests.items():
+            self.assertEqual(block.count("cargo fmt --all -- --check"), 1, platform)
+            self.assertLess(
+                block.index("cargo fmt --all -- --check"),
+                block.index("cargo fetch --locked"),
+                platform,
+            )
+            self.assertEqual(block.count(test_command), 1, platform)
+            self.assertNotIn("--test-threads", block, platform)
+
     def test_canary_observations_are_native_only_and_outside_provenance(self) -> None:
         workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
         jobs = _job_blocks(workflow)

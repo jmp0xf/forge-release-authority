@@ -163,16 +163,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --component rustfmt --target "$TARGET"
           rustup default "$RUSTUP_TOOLCHAIN"
           [[ "$(rustc --version | awk '{print $2}')" == "$RUSTUP_TOOLCHAIN" ]]
           rustc --version --verbose
+          cargo clippy --version
+          cargo fmt --version
       - name: Install exact Rust toolchain on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component clippy --target $env:TARGET
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component clippy --component rustfmt --target $env:TARGET
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $env:RUSTUP_TOOLCHAIN
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -182,6 +184,10 @@ jobs:
             throw "unexpected rustc version: $version"
           }
           rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo fmt --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Install native musl toolchain
         if: runner.os == 'Linux'
@@ -211,6 +217,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ -z "$(git status --porcelain=v2 --untracked-files=all --ignore-submodules=none)" ]]
+          cargo fmt --all -- --check
           cargo fetch --locked
           cargo check --locked --offline --workspace --all-targets --target "$TARGET"
           cargo clippy --locked --offline --workspace --all-targets --target "$TARGET" -- -D warnings
@@ -261,6 +268,8 @@ jobs:
           $status = git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($status) { throw "Forge checkout is not clean" }
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo fetch --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo check --locked --offline --workspace --all-targets --target $env:TARGET

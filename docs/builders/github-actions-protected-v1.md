@@ -49,6 +49,11 @@ They may read source and upload workflow artifacts. They must not receive an OID
 repository secret, attestation permission, GitHub Release permission, or other publication credential. Each emits one
 binary, one SBOM, and one bounded builder record.
 
+Each native job provisions the policy-pinned Rust toolchain with both `clippy` and `rustfmt` explicitly installed and
+version-probed before candidate execution. The source gates begin with `cargo fmt --all -- --check`; they do not depend
+on a component that happens to remain in a hosted runner image. Candidate tests retain their project-native parallel
+execution and failure semantics.
+
 For the inactive canary only, each native job also writes and uploads one create-only, target-specific runner
 observation retained for 30 days. The standard-library-only collector bounds command time and output, file hashing,
 directory scans, manifest entries, and final JSON size. It reads only an explicit runner-environment allowlist, replaces
