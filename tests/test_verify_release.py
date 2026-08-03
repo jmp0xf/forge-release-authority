@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import os
+import stat
 import struct
 import tempfile
 import unittest
@@ -35,6 +36,11 @@ ACTIONS_ENVIRONMENT = {
     "GITHUB_SHA": AUTHORITY_COMMIT,
     "GITHUB_WORKFLOW_REF": verifier.AUTHORITY_WORKFLOW_REF,
     "GITHUB_WORKFLOW_SHA": AUTHORITY_COMMIT,
+}
+EXACT_OUTPUT_TEST_BUDGETS = {
+    "maximum_file_count": 4,
+    "maximum_file_bytes": 64,
+    "maximum_total_bytes": 128,
 }
 LOCK_BYTES = (
     b"version = 4\n\n"
@@ -1112,6 +1118,9 @@ class VerifyReleaseTests(unittest.TestCase):
         with mock.patch.object(os, "geteuid", None):
             with self.assertRaisesRegex(verifier.VerificationError, "geteuid"):
                 verifier._require_secure_posix_fs_capabilities()
+        with mock.patch.object(os, "fchmod", None):
+            with self.assertRaisesRegex(verifier.VerificationError, "fchmod"):
+                verifier._require_exact_io_capabilities()
 
     def test_json_integer_and_directory_enumeration_work_are_bounded(self) -> None:
         with self.assertRaisesRegex(verifier.VerificationError, "integer exceeds"):
@@ -1341,6 +1350,529 @@ class VerifyReleaseTests(unittest.TestCase):
                             64,
                             "identity fixture",
                         )
+
+    def test_exact_input_is_immutable_stable_and_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "input"
+            root.mkdir()
+            (root / "descriptor.json").write_bytes(b'{"schema":"fixture"}\n')
+            (root / "payload").write_bytes(b"payload\n")
+            limits = {"descriptor.json": 128, "payload": 128}
+            with (
+                mock.patch.object(
+                    verifier,
+                    "_resolve_github_materials",
+                    side_effect=AssertionError("exact input must stay offline"),
+                ),
+                mock.patch.object(
+                    verifier,
+                    "_authority_commit_from_actions_environment",
+                    side_effect=AssertionError("exact input must ignore Actions"),
+                ),
+                mock.patch.object(
+                    verifier,
+                    "build_opener",
+                    side_effect=AssertionError("exact input must not use the network"),
+                ),
+                verifier.open_exact_input(root, limits, 256, "build input") as opened,
+            ):
+                self.assertEqual(opened.resolved_path, root.resolve())
+                self.assertEqual(opened.files["payload"], b"payload\n")
+                with self.assertRaises(TypeError):
+                    opened.files["payload"] = b"changed"  # type: ignore[index]
+                opened.revalidate(rehash=False)
+                opened.revalidate()
+                held_fd = opened._directory.directory_fd
+                os.fstat(held_fd)
+            with self.assertRaises(OSError):
+                os.fstat(held_fd)
+
+    def test_exact_input_rejects_reused_fd_after_context_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "input"
+            root.mkdir()
+            (root / "item").write_bytes(b"value")
+            with verifier.open_exact_input(
+                root, {"item": 16}, 16, "short-lived input"
+            ) as opened:
+                stale = opened
+                released_fd = opened._directory.directory_fd
+
+            reopened_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            if reopened_fd != released_fd:
+                os.dup2(reopened_fd, released_fd)
+                os.close(reopened_fd)
+            try:
+                self.assertEqual(os.fstat(released_fd).st_ino, root.stat().st_ino)
+                with self.assertRaisesRegex(verifier.VerificationError, "closed"):
+                    stale.revalidate()
+            finally:
+                os.close(released_fd)
+
+    def test_exact_output_rejects_closed_disjoint_input_with_reused_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            input_directory = parent / "input"
+            output_directory = parent / "output"
+            input_directory.mkdir()
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            (input_directory / "item").write_bytes(b"value")
+            with verifier.open_exact_input(
+                input_directory, {"item": 16}, 16, "closed input"
+            ) as opened:
+                stale = opened
+                released_fd = opened._directory.directory_fd
+
+            reopened_fd = os.open(input_directory, os.O_RDONLY | os.O_DIRECTORY)
+            if reopened_fd != released_fd:
+                os.dup2(reopened_fd, released_fd)
+                os.close(reopened_fd)
+            created: verifier.ExactOutput | None = None
+            try:
+                with self.assertRaisesRegex(verifier.VerificationError, "closed"):
+                    created = verifier.create_exact_output(
+                        output_directory,
+                        {"result": b"result"},
+                        [stale],
+                        "stale-bound output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+            finally:
+                if created is not None:
+                    created.close()
+                os.close(released_fd)
+            self.assertEqual(list(output_directory.iterdir()), [])
+
+    def test_exact_input_rejects_path_file_and_content_drift(self) -> None:
+        with self.subTest("directory replacement"):
+            with tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                root = parent / "input"
+                moved = parent / "moved"
+                root.mkdir()
+                (root / "item").write_bytes(b"same")
+                with self.assertRaises(verifier.VerificationError):
+                    with verifier.open_exact_input(
+                        root, {"item": 16}, 16, "replaceable input"
+                    ):
+                        root.rename(moved)
+                        root.mkdir()
+                        (root / "item").write_bytes(b"same")
+
+        with self.subTest("ancestor replacement"):
+            with tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                ancestor = parent / "ancestor"
+                root = ancestor / "input"
+                moved = parent / "moved-ancestor"
+                root.mkdir(parents=True)
+                (root / "item").write_bytes(b"same")
+                with self.assertRaises(verifier.VerificationError):
+                    with verifier.open_exact_input(
+                        root, {"item": 16}, 16, "ancestor-bound input"
+                    ):
+                        ancestor.rename(moved)
+                        root.mkdir(parents=True)
+                        (root / "item").write_bytes(b"same")
+
+        for mutation_name, mutate in (
+            (
+                "file replacement",
+                lambda item: (item.unlink(), item.write_bytes(b"same")),
+            ),
+            ("content rewrite", lambda item: item.write_bytes(b"diff")),
+        ):
+            with self.subTest(mutation_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "input"
+                root.mkdir()
+                item = root / "item"
+                item.write_bytes(b"same")
+                with self.assertRaises(verifier.VerificationError):
+                    with verifier.open_exact_input(
+                        root, {"item": 16}, 16, "mutable input"
+                    ):
+                        mutate(item)
+
+    def test_exact_input_rejects_non_exact_and_aliased_files(self) -> None:
+        for mutation_name in ("missing", "extra", "casefold", "symlink", "hardlink"):
+            with self.subTest(mutation_name), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                root = parent / "input"
+                root.mkdir()
+                limits = {"item": 16}
+                item = root / "item"
+                if mutation_name != "missing":
+                    item.write_bytes(b"value")
+                if mutation_name == "extra":
+                    (root / "extra").write_bytes(b"extra")
+                elif mutation_name == "casefold":
+                    limits["ITEM"] = 16
+                elif mutation_name == "symlink":
+                    item.unlink()
+                    outside = parent / "outside"
+                    outside.write_bytes(b"value")
+                    item.symlink_to(outside)
+                elif mutation_name == "hardlink":
+                    os.link(item, parent / "outside-link")
+                with self.assertRaises(verifier.VerificationError):
+                    with verifier.open_exact_input(root, limits, 32, "unsafe input"):
+                        self.fail("unsafe exact input was accepted")
+
+    def test_exact_output_is_private_durable_exact_and_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            input_directory = parent / "input"
+            output_directory = parent / "output"
+            input_directory.mkdir()
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            (input_directory / "source").write_bytes(b"source")
+            real_fsync = os.fsync
+            synced_directory = False
+
+            def track_fsync(file_fd: int) -> None:
+                nonlocal synced_directory
+                if stat.S_ISDIR(os.fstat(file_fd).st_mode):
+                    synced_directory = True
+                real_fsync(file_fd)
+
+            with verifier.open_exact_input(
+                input_directory, {"source": 16}, 16, "source input"
+            ) as opened:
+                with (
+                    mock.patch.object(
+                        verifier,
+                        "_resolve_github_materials",
+                        side_effect=AssertionError("exact output must stay offline"),
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_authority_commit_from_actions_environment",
+                        side_effect=AssertionError("exact output must ignore Actions"),
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "build_opener",
+                        side_effect=AssertionError(
+                            "exact output must not use the network"
+                        ),
+                    ),
+                    mock.patch.object(os, "fsync", side_effect=track_fsync),
+                ):
+                    output = verifier.create_exact_output(
+                        output_directory,
+                        {"binary": b"binary", "sbom.json": b"{}\n"},
+                        [opened],
+                        "build output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+                    with output:
+                        resolved = output.resolved_path
+                        output.revalidate()
+                        held_output_directory_fd = output._directory.directory_fd
+                        os.fstat(held_output_directory_fd)
+            self.assertEqual(resolved, output_directory.resolve())
+            with self.assertRaises(OSError):
+                os.fstat(held_output_directory_fd)
+            self.assertTrue(synced_directory)
+            self.assertEqual(
+                sorted(path.name for path in output_directory.iterdir()),
+                ["binary", "sbom.json"],
+            )
+            self.assertEqual((output_directory / "binary").read_bytes(), b"binary")
+            for path in output_directory.iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(path.stat().st_nlink, 1)
+
+    def test_exact_output_rejects_unsafe_or_nonfresh_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            input_directory = parent / "input"
+            input_directory.mkdir()
+            (input_directory / "source").write_bytes(b"source")
+            with verifier.open_exact_input(
+                input_directory, {"source": 16}, 16, "source input"
+            ) as opened:
+                occupied = parent / "occupied"
+                occupied.mkdir(mode=0o700)
+                occupied.chmod(0o700)
+                (occupied / "existing").write_bytes(b"occupied")
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.create_exact_output(
+                        occupied,
+                        {"result": b"result"},
+                        [opened],
+                        "occupied output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.create_exact_output(
+                        input_directory,
+                        {"result": b"result"},
+                        [opened],
+                        "overlapping output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+
+                casefold = parent / "casefold"
+                casefold.mkdir(mode=0o700)
+                casefold.chmod(0o700)
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.create_exact_output(
+                        casefold,
+                        {"Result": b"one", "result": b"two"},
+                        [opened],
+                        "casefold output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+
+                target = parent / "target"
+                target.mkdir(mode=0o700)
+                target.chmod(0o700)
+                alias = parent / "output-link"
+                alias.symlink_to(target, target_is_directory=True)
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.create_exact_output(
+                        alias,
+                        {"result": b"result"},
+                        [opened],
+                        "linked output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+
+    def test_exact_output_finally_rechecks_names_after_input_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            input_directory = parent / "input"
+            output_directory = parent / "output"
+            input_directory.mkdir()
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            (input_directory / "source").write_bytes(b"source")
+            calls = 0
+            real_revalidate = verifier.ExactInput.revalidate
+
+            def replace_output_after_input_check(
+                opened: verifier.ExactInput, rehash: bool = True
+            ) -> None:
+                nonlocal calls
+                real_revalidate(opened, rehash=rehash)
+                calls += 1
+                if calls == 2:
+                    output = output_directory / "result"
+                    output.rename(output_directory / "detached-result")
+                    output.write_bytes(b"replacement")
+                    output.chmod(0o600)
+
+            with verifier.open_exact_input(
+                input_directory, {"source": 16}, 16, "source input"
+            ) as opened:
+                with (
+                    mock.patch.object(
+                        verifier.ExactInput,
+                        "revalidate",
+                        autospec=True,
+                        side_effect=replace_output_after_input_check,
+                    ),
+                    self.assertRaises(verifier.VerificationError),
+                ):
+                    verifier.create_exact_output(
+                        output_directory,
+                        {"result": b"result"},
+                        [opened],
+                        "replaceable output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+            self.assertEqual(calls, 2)
+            self.assertEqual((output_directory / "result").read_bytes(), b"replacement")
+
+    def test_exact_output_rechecks_visible_identity_after_final_content_hash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            output_directory = parent / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            output_path = output_directory / "result"
+            detached_path = parent / "detached-result"
+            real_sha256 = verifier._sha256
+            result_hash_calls = 0
+
+            def replace_during_final_hash(data: bytes) -> str:
+                nonlocal result_hash_calls
+                digest = real_sha256(data)
+                if data == b"result":
+                    result_hash_calls += 1
+                    if result_hash_calls == 3:
+                        output_path.rename(detached_path)
+                        output_path.write_bytes(b"attack")
+                        output_path.chmod(0o600)
+                return digest
+
+            created: verifier.ExactOutput | None = None
+            try:
+                with (
+                    mock.patch.object(
+                        verifier, "_sha256", side_effect=replace_during_final_hash
+                    ),
+                    self.assertRaises(verifier.VerificationError),
+                ):
+                    created = verifier.create_exact_output(
+                        output_directory,
+                        {"result": b"result"},
+                        [],
+                        "hash-raced output",
+                        **EXACT_OUTPUT_TEST_BUDGETS,
+                    )
+            finally:
+                if created is not None:
+                    created.close()
+            self.assertEqual(result_hash_calls, 3)
+            self.assertEqual(output_path.read_bytes(), b"attack")
+            self.assertEqual(detached_path.read_bytes(), b"result")
+
+    def test_exact_output_retains_partial_file_without_name_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            real_write = os.write
+            write_calls = 0
+
+            def interrupt_write(file_fd: int, data: bytes | memoryview) -> int:
+                nonlocal write_calls
+                write_calls += 1
+                if write_calls == 1:
+                    return real_write(file_fd, bytes(data[:1]))
+                raise OSError("synthetic interrupted write")
+
+            with (
+                mock.patch.object(os, "write", side_effect=interrupt_write),
+                mock.patch.object(
+                    os,
+                    "unlink",
+                    side_effect=AssertionError(
+                        "visible output names must never be unlinked after failure"
+                    ),
+                ) as unlink_mock,
+                self.assertRaisesRegex(
+                    verifier.VerificationError, "synthetic interrupted write.*retained"
+                ),
+            ):
+                verifier.create_exact_output(
+                    output_directory,
+                    {"result": b"complete"},
+                    [],
+                    "partial output",
+                    **EXACT_OUTPUT_TEST_BUDGETS,
+                )
+            unlink_mock.assert_not_called()
+            self.assertEqual((output_directory / "result").read_bytes(), b"c")
+
+    def test_exact_output_enforces_required_count_file_and_total_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            boundary = parent / "boundary"
+            boundary.mkdir(mode=0o700)
+            boundary.chmod(0o700)
+            output = verifier.create_exact_output(
+                boundary,
+                {"one": b"1234", "two": b"5678"},
+                [],
+                "budget boundary",
+                maximum_file_count=2,
+                maximum_file_bytes=4,
+                maximum_total_bytes=8,
+            )
+            output.close()
+            self.assertEqual(sorted(path.name for path in boundary.iterdir()), ["one", "two"])
+
+            cases = (
+                (
+                    "count",
+                    {"one": b"1", "two": b"2", "three": b"3"},
+                    {"maximum_file_count": 2, "maximum_file_bytes": 4, "maximum_total_bytes": 8},
+                ),
+                (
+                    "file",
+                    {"one": b"12345"},
+                    {"maximum_file_count": 2, "maximum_file_bytes": 4, "maximum_total_bytes": 8},
+                ),
+                (
+                    "total",
+                    {"one": b"1234", "two": b"56789"},
+                    {"maximum_file_count": 2, "maximum_file_bytes": 5, "maximum_total_bytes": 8},
+                ),
+            )
+            for name, files, budgets in cases:
+                with self.subTest(name=name):
+                    target = parent / name
+                    target.mkdir(mode=0o700)
+                    target.chmod(0o700)
+                    with self.assertRaises(verifier.VerificationError):
+                        verifier.create_exact_output(
+                            target, files, [], f"{name} budget output", **budgets
+                        )
+                    self.assertEqual(list(target.iterdir()), [])
+
+            missing = parent / "missing-budget"
+            missing.mkdir(mode=0o700)
+            missing.chmod(0o700)
+            with self.assertRaises(TypeError):
+                verifier.create_exact_output(
+                    missing, {"one": b"1"}, [], "missing budget output"
+                )
+            self.assertEqual(list(missing.iterdir()), [])
+
+    def test_exact_output_rechecks_final_budget_through_pinned_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            input_directory = parent / "input"
+            output_directory = parent / "output"
+            input_directory.mkdir()
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            (input_directory / "source").write_bytes(b"source")
+            calls = 0
+            real_revalidate = verifier.ExactInput.revalidate
+
+            def grow_output_after_input_check(
+                opened: verifier.ExactInput, rehash: bool = True
+            ) -> None:
+                nonlocal calls
+                real_revalidate(opened, rehash=rehash)
+                calls += 1
+                if calls == 2:
+                    with (output_directory / "result").open("ab") as output:
+                        output.write(b"5")
+
+            with verifier.open_exact_input(
+                input_directory, {"source": 16}, 16, "source input"
+            ) as opened:
+                with (
+                    mock.patch.object(
+                        verifier.ExactInput,
+                        "revalidate",
+                        autospec=True,
+                        side_effect=grow_output_after_input_check,
+                    ),
+                    self.assertRaisesRegex(
+                        verifier.VerificationError, "4-byte total output limit"
+                    ),
+                ):
+                    verifier.create_exact_output(
+                        output_directory,
+                        {"result": b"1234"},
+                        [opened],
+                        "growing output",
+                        maximum_file_count=1,
+                        maximum_file_bytes=8,
+                        maximum_total_bytes=4,
+                    )
+            self.assertEqual((output_directory / "result").read_bytes(), b"12345")
 
     def test_canonical_projection_receipt_binds_refs_fields_and_root_edges(
         self,

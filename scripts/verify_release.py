@@ -22,9 +22,11 @@ import stat
 import struct
 import sys
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence, cast
+from types import MappingProxyType
+from typing import Any, Callable, Iterator, Mapping, Sequence, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -162,6 +164,84 @@ class _CreatedOutput:
     identity: StatIdentity
     expected_length: int
     expected_sha256: str
+    expected_mode: int | None
+    require_single_link: bool
+
+
+@dataclass(frozen=True)
+class ExactInput:
+    """An immutable exact-directory snapshot backed by a held directory fd."""
+
+    files: Mapping[str, bytes]
+    resolved_path: Path
+    _directory: _PinnedDirectory
+    _limits_by_name: Mapping[str, int]
+    _total_limit: int
+    _label: str
+    _directory_identity: StatIdentity
+    _entry_identities: Mapping[str, StatIdentity]
+    _path_component_identities: tuple[tuple[str, str, ObjectIdentity], ...]
+    _content_sha256: Mapping[str, str]
+    _closed: bool = False
+
+    def revalidate(self, rehash: bool = True) -> None:
+        """Reject any path, identity, exact-set, or optional content drift."""
+        if self._closed:
+            raise VerificationError(f"{self._label} input is already closed")
+        _revalidate_exact_input(self, rehash=rehash)
+
+
+@dataclass(frozen=True)
+class ExactOutput:
+    """Pinned exact outputs for consumption by the next Authority phase.
+
+    The sandbox backend must keep every external writer terminated while this
+    object is alive. POSIX file descriptors detect name and identity drift but
+    cannot by themselves exclude a concurrent process with the same uid.
+    """
+
+    resolved_path: Path
+    names: tuple[str, ...]
+    _directory: _PinnedDirectory
+    _created_outputs: tuple[_CreatedOutput, ...]
+    _path_component_identities: tuple[tuple[str, str, ObjectIdentity], ...]
+    _maximum_file_count: int
+    _maximum_file_bytes: int
+    _maximum_total_bytes: int
+    _label: str
+    _closed: bool = False
+
+    def revalidate(self) -> None:
+        """Recheck held fds, visible names, identities, bytes, and budgets."""
+        if self._closed:
+            raise VerificationError(f"{self._label} output is already closed")
+        _revalidate_exact_output(self)
+
+    def close(self) -> None:
+        """Release held output fds without deleting any visible filesystem name."""
+        if self._closed:
+            return
+        for created in self._created_outputs:
+            _close_fd(created.file_fd)
+        _close_pinned_directory(self._directory)
+        object.__setattr__(self, "_closed", True)
+
+    def __enter__(self) -> ExactOutput:
+        if self._closed:
+            raise VerificationError(f"{self._label} output is already closed")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: Any,
+    ) -> None:
+        try:
+            if exception_type is None:
+                self.revalidate()
+        finally:
+            self.close()
 
 
 @dataclass(frozen=True)
@@ -214,6 +294,22 @@ def _require_secure_posix_fs_capabilities() -> None:
     if missing:
         raise VerificationError(
             "required secure POSIX filesystem capabilities unavailable: "
+            + ", ".join(missing)
+        )
+
+
+def _require_exact_io_capabilities() -> None:
+    """Fail closed unless the exact-I/O wrappers can enforce their contract."""
+    _require_secure_posix_fs_capabilities()
+    missing: list[str] = []
+    if not isinstance(getattr(os, "O_EXCL", None), int) or os.O_EXCL == 0:
+        missing.append("O_EXCL")
+    for name in ("fchmod", "fsync"):
+        if not callable(getattr(os, name, None)):
+            missing.append(name)
+    if missing:
+        raise VerificationError(
+            "required exact-I/O POSIX capabilities unavailable: "
             + ", ".join(missing)
         )
 
@@ -343,6 +439,33 @@ def _require_pinned_directory_path_stable(directory: _PinnedDirectory) -> None:
             )
     finally:
         _close_pinned_directory(reopened)
+
+
+def _path_component_identities(
+    requested_path: Path, resolved_path: Path, label: str
+) -> tuple[tuple[str, str, ObjectIdentity], ...]:
+    """Snapshot requested and canonical path components without hiding aliases."""
+
+    def snapshot(kind: str, absolute_path: Path) -> list[tuple[str, str, ObjectIdentity]]:
+        if not absolute_path.is_absolute():
+            raise VerificationError(f"{label} {kind} path must be absolute")
+        current = Path(absolute_path.anchor)
+        result: list[tuple[str, str, ObjectIdentity]] = []
+        for component in (None, *absolute_path.parts[1:]):
+            if component is not None:
+                current /= component
+            try:
+                visible = current.lstat()
+            except OSError as error:
+                raise VerificationError(
+                    f"cannot inspect {label} {kind} path component {current}: {error}"
+                ) from error
+            result.append((kind, str(current), _object_identity(visible)))
+        return result
+
+    return tuple(
+        snapshot("requested", requested_path) + snapshot("resolved", resolved_path)
+    )
 
 
 def _directory_is_same_or_descendant(
@@ -1200,6 +1323,23 @@ def _read_exact_pinned_directory(
     total_limit: int,
     label: str,
 ) -> dict[str, bytes]:
+    files, _directory_identity, _entry_identities = (
+        _read_exact_pinned_directory_snapshot(
+            directory, expected_names, size_limit, total_limit, label
+        )
+    )
+    return files
+
+
+def _read_exact_pinned_directory_snapshot(
+    directory: _PinnedDirectory,
+    expected_names: Sequence[str],
+    size_limit: Callable[[str], int],
+    total_limit: int,
+    label: str,
+    *,
+    require_single_link: bool = False,
+) -> tuple[dict[str, bytes], StatIdentity, Mapping[str, StatIdentity]]:
     """Read one exact directory snapshot through its already-held inode."""
     if total_limit <= 0:
         raise VerificationError(f"{label} total byte limit must be positive")
@@ -1221,6 +1361,17 @@ def _read_exact_pinned_directory(
     entry_identities: dict[str, StatIdentity] = {}
     total = 0
     for name in expected:
+        if require_single_link:
+            try:
+                visible_before = os.stat(
+                    name, dir_fd=directory.directory_fd, follow_symlinks=False
+                )
+            except OSError as error:
+                raise VerificationError(
+                    f"cannot inspect {label}/{name}: {error}"
+                ) from error
+            if visible_before.st_nlink != 1:
+                raise VerificationError(f"{label}/{name} must not be hard-linked")
         data, identity = _read_regular_file_at(
             directory.directory_fd,
             name,
@@ -1249,13 +1400,191 @@ def _read_exact_pinned_directory(
             raise VerificationError(
                 f"cannot re-inspect {label}/{name}: {error}"
             ) from error
-        if _stat_identity(visible_final) != entry_identities[name]:
+        if (
+            _stat_identity(visible_final) != entry_identities[name]
+            or (require_single_link and visible_final.st_nlink != 1)
+        ):
             raise VerificationError(f"{label}/{name} changed after it was read")
     directory_after = _fstat(directory.directory_fd, f"{label} directory")
     if _stat_identity(directory_before) != _stat_identity(directory_after):
         raise VerificationError(f"{label} directory changed during verification")
     _require_pinned_directory_path_stable(directory)
-    return result
+    return (
+        result,
+        _stat_identity(directory_after),
+        MappingProxyType(entry_identities),
+    )
+
+
+def _normalize_exact_file_limits(
+    limits_by_name: Mapping[str, int], total_limit: int, label: str
+) -> Mapping[str, int]:
+    if isinstance(total_limit, bool) or not isinstance(total_limit, int):
+        raise VerificationError(f"{label} total byte limit must be an integer")
+    if total_limit <= 0:
+        raise VerificationError(f"{label} total byte limit must be positive")
+    normalized: dict[str, int] = {}
+    for candidate_name, candidate_limit in limits_by_name.items():
+        name = _require_safe_basename(candidate_name, f"{label} input name")
+        if isinstance(candidate_limit, bool) or not isinstance(candidate_limit, int):
+            raise VerificationError(f"{label}/{name} byte limit must be an integer")
+        if candidate_limit <= 0:
+            raise VerificationError(f"{label}/{name} byte limit must be positive")
+        normalized[name] = candidate_limit
+    _require_unique_casefold(list(normalized), f"{label} input names")
+    return MappingProxyType(normalized)
+
+
+def _inspect_exact_pinned_directory(
+    directory: _PinnedDirectory,
+    limits_by_name: Mapping[str, int],
+    total_limit: int,
+    label: str,
+) -> tuple[StatIdentity, Mapping[str, StatIdentity]]:
+    """Capture exact entry identities without opening untrusted path strings."""
+    directory_before = _fstat(directory.directory_fd, f"{label} directory")
+    if (
+        not stat.S_ISDIR(directory_before.st_mode)
+        or _object_identity(directory_before) != directory.directory_identity
+    ):
+        raise VerificationError(f"{label} directory changed before inspection")
+    expected = sorted(limits_by_name)
+    names = _bounded_directory_names(directory.directory_fd, len(expected), label)
+    _require_unique_casefold(names, f"{label} directory")
+    if names != expected:
+        raise VerificationError(
+            f"{label} file set differs from contract; "
+            f"missing={sorted(set(expected) - set(names))}, "
+            f"extra={sorted(set(names) - set(expected))}"
+        )
+    identities: dict[str, StatIdentity] = {}
+    total = 0
+    for name in expected:
+        try:
+            visible = os.stat(name, dir_fd=directory.directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise VerificationError(f"cannot inspect {label}/{name}: {error}") from error
+        if not stat.S_ISREG(visible.st_mode) or stat.S_ISLNK(visible.st_mode):
+            raise VerificationError(f"{label}/{name} must be a non-symlink regular file")
+        if visible.st_nlink != 1:
+            raise VerificationError(f"{label}/{name} must not be hard-linked")
+        if visible.st_size <= 0:
+            raise VerificationError(f"{label}/{name} must not be empty")
+        limit = limits_by_name[name]
+        if visible.st_size > limit:
+            raise VerificationError(f"{label}/{name} exceeds its {limit}-byte limit")
+        total += visible.st_size
+        if total > total_limit:
+            raise VerificationError(f"{label} exceeds its total byte limit")
+        identities[name] = _stat_identity(visible)
+    if _bounded_directory_names(directory.directory_fd, len(expected), label) != expected:
+        raise VerificationError(f"{label} directory changed during inspection")
+    directory_after = _fstat(directory.directory_fd, f"{label} directory")
+    if _stat_identity(directory_before) != _stat_identity(directory_after):
+        raise VerificationError(f"{label} directory changed during inspection")
+    _require_pinned_directory_path_stable(directory)
+    return _stat_identity(directory_after), MappingProxyType(identities)
+
+
+def _revalidate_exact_input(snapshot: ExactInput, *, rehash: bool) -> None:
+    if not isinstance(rehash, bool):
+        raise VerificationError(f"{snapshot._label} rehash must be a boolean")
+    components_before = _path_component_identities(
+        snapshot._directory.requested_path,
+        snapshot._directory.resolved_path,
+        snapshot._label,
+    )
+    if components_before != snapshot._path_component_identities:
+        raise VerificationError(f"{snapshot._label} path or ancestor identity changed")
+    if rehash:
+        files, directory_identity, entry_identities = (
+            _read_exact_pinned_directory_snapshot(
+                snapshot._directory,
+                sorted(snapshot._limits_by_name),
+                snapshot._limits_by_name.__getitem__,
+                snapshot._total_limit,
+                snapshot._label,
+                require_single_link=True,
+            )
+        )
+        content_sha256 = {name: _sha256(data) for name, data in files.items()}
+        if content_sha256 != dict(snapshot._content_sha256):
+            raise VerificationError(f"{snapshot._label} file content changed")
+    else:
+        directory_identity, entry_identities = _inspect_exact_pinned_directory(
+            snapshot._directory,
+            snapshot._limits_by_name,
+            snapshot._total_limit,
+            snapshot._label,
+        )
+    if directory_identity != snapshot._directory_identity:
+        raise VerificationError(f"{snapshot._label} directory identity changed")
+    if dict(entry_identities) != dict(snapshot._entry_identities):
+        raise VerificationError(f"{snapshot._label} file identity changed")
+    components_after = _path_component_identities(
+        snapshot._directory.requested_path,
+        snapshot._directory.resolved_path,
+        snapshot._label,
+    )
+    if components_after != snapshot._path_component_identities:
+        raise VerificationError(f"{snapshot._label} path or ancestor identity changed")
+
+
+@contextmanager
+def open_exact_input(
+    directory: Path,
+    limits_by_name: Mapping[str, int],
+    total_limit: int,
+    label: str,
+) -> Iterator[ExactInput]:
+    """Open one bounded exact input set and hold its directory until context exit."""
+    _require_exact_io_capabilities()
+    limits = _normalize_exact_file_limits(limits_by_name, total_limit, label)
+    pinned = _pin_directory(directory, f"{label} directory")
+    snapshot: ExactInput | None = None
+    try:
+        components_before = _path_component_identities(
+            pinned.requested_path, pinned.resolved_path, label
+        )
+        files, directory_identity, entry_identities = (
+            _read_exact_pinned_directory_snapshot(
+                pinned,
+                sorted(limits),
+                limits.__getitem__,
+                total_limit,
+                label,
+                require_single_link=True,
+            )
+        )
+        components_after = _path_component_identities(
+            pinned.requested_path, pinned.resolved_path, label
+        )
+        if components_before != components_after:
+            raise VerificationError(f"{label} path or ancestor changed while opening")
+        snapshot = ExactInput(
+            files=MappingProxyType(files),
+            resolved_path=pinned.resolved_path,
+            _directory=pinned,
+            _limits_by_name=limits,
+            _total_limit=total_limit,
+            _label=label,
+            _directory_identity=directory_identity,
+            _entry_identities=entry_identities,
+            _path_component_identities=components_after,
+            _content_sha256=MappingProxyType(
+                {name: _sha256(data) for name, data in files.items()}
+            ),
+        )
+        try:
+            yield snapshot
+        except BaseException:
+            raise
+        else:
+            snapshot.revalidate()
+    finally:
+        if snapshot is not None:
+            object.__setattr__(snapshot, "_closed", True)
+        _close_pinned_directory(pinned)
 
 
 def _read_regular_file_at(
@@ -2652,7 +2981,14 @@ def _require_fresh_private_output_directories(
         )
 
 
-def _write_create_only(output: _PinnedOutput, data: bytes) -> _CreatedOutput:
+def _write_create_only(
+    output: _PinnedOutput,
+    data: bytes,
+    *,
+    mode: int | None = None,
+    require_single_link: bool = False,
+    retain_partial_on_failure: bool = False,
+) -> _CreatedOutput:
     """Create one output and keep its inode open for the final set-wide check."""
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
@@ -2667,10 +3003,16 @@ def _write_create_only(output: _PinnedOutput, data: bytes) -> _CreatedOutput:
             f"refusing to overwrite qualification output {output.path}: {error}"
         ) from error
     try:
+        if mode is not None:
+            os.fchmod(file_fd, mode)
         opened = _fstat(file_fd, f"qualification output {output.path}")
-        if not stat.S_ISREG(opened.st_mode):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (mode is not None and stat.S_IMODE(opened.st_mode) != mode)
+            or (require_single_link and opened.st_nlink != 1)
+        ):
             raise VerificationError(
-                f"qualification output {output.path} is not a regular file"
+                f"qualification output {output.path} is not a private regular file"
             )
         view = memoryview(data)
         while view:
@@ -2690,6 +3032,9 @@ def _write_create_only(output: _PinnedOutput, data: bytes) -> _CreatedOutput:
         identity = _stat_identity(after)
         if (
             not stat.S_ISREG(after.st_mode)
+            or (mode is not None and stat.S_IMODE(after.st_mode) != mode)
+            or (require_single_link and after.st_nlink != 1)
+            or (require_single_link and visible_after.st_nlink != 1)
             or _object_identity(opened) != _object_identity(after)
             or identity != _stat_identity(visible_after)
             or after.st_size != len(data)
@@ -2703,17 +3048,29 @@ def _write_create_only(output: _PinnedOutput, data: bytes) -> _CreatedOutput:
             identity=identity,
             expected_length=len(data),
             expected_sha256=_sha256(data),
+            expected_mode=mode,
+            require_single_link=require_single_link,
         )
-    except VerificationError:
-        os.close(file_fd)
+    except VerificationError as error:
+        _close_fd(file_fd)
+        if retain_partial_on_failure:
+            raise VerificationError(
+                f"{error}; partial output retained for fail-closed quarantine"
+            ) from error
         raise
     except OSError as error:
-        os.close(file_fd)
+        _close_fd(file_fd)
+        retained = (
+            "; partial output retained for fail-closed quarantine"
+            if retain_partial_on_failure
+            else ""
+        )
         raise VerificationError(
-            f"cannot securely create qualification output {output.path}: {error}"
+            f"cannot securely create qualification output {output.path}: "
+            f"{error}{retained}"
         ) from error
     except BaseException:
-        os.close(file_fd)
+        _close_fd(file_fd)
         raise
 
 
@@ -2731,6 +3088,16 @@ def _require_created_outputs_stable(outputs: Sequence[_CreatedOutput]) -> None:
             if (
                 _stat_identity(opened) != created.identity
                 or _stat_identity(visible) != created.identity
+                or (created.require_single_link and opened.st_nlink != 1)
+                or (created.require_single_link and visible.st_nlink != 1)
+                or (
+                    created.expected_mode is not None
+                    and stat.S_IMODE(opened.st_mode) != created.expected_mode
+                )
+                or (
+                    created.expected_mode is not None
+                    and stat.S_IMODE(visible.st_mode) != created.expected_mode
+                )
                 or opened.st_size != created.expected_length
             ):
                 raise VerificationError(
@@ -2755,6 +3122,11 @@ def _require_created_outputs_stable(outputs: Sequence[_CreatedOutput]) -> None:
             _stat_identity(opened) != created.identity
             or _stat_identity(final) != created.identity
             or _stat_identity(visible) != created.identity
+            or (created.require_single_link and final.st_nlink != 1)
+            or (
+                created.expected_mode is not None
+                and stat.S_IMODE(final.st_mode) != created.expected_mode
+            )
             or remaining != 0
             or trailing
             or _sha256(b"".join(chunks)) != created.expected_sha256
@@ -2762,6 +3134,294 @@ def _require_created_outputs_stable(outputs: Sequence[_CreatedOutput]) -> None:
             raise VerificationError(
                 f"qualification output {output.path} changed before completion"
             )
+
+
+def _normalize_exact_output_files(
+    files: Mapping[str, bytes],
+    label: str,
+    *,
+    maximum_file_count: int,
+    maximum_file_bytes: int,
+    maximum_total_bytes: int,
+) -> Mapping[str, bytes]:
+    for name, value in (
+        ("maximum file count", maximum_file_count),
+        ("maximum file bytes", maximum_file_bytes),
+        ("maximum total bytes", maximum_total_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise VerificationError(f"{label} {name} must be a positive integer")
+    if len(files) > maximum_file_count:
+        raise VerificationError(
+            f"{label} exceeds the {maximum_file_count}-file output limit"
+        )
+    normalized: dict[str, bytes] = {}
+    total = 0
+    for index, (candidate_name, data) in enumerate(files.items()):
+        if index >= maximum_file_count:
+            raise VerificationError(
+                f"{label} exceeds the {maximum_file_count}-file output limit"
+            )
+        name = _require_safe_basename(candidate_name, f"{label} output name")
+        if not isinstance(data, bytes):
+            raise VerificationError(f"{label}/{name} output must be bytes")
+        if len(data) > maximum_file_bytes:
+            raise VerificationError(
+                f"{label}/{name} exceeds the {maximum_file_bytes}-byte output limit"
+            )
+        total += len(data)
+        if total > maximum_total_bytes:
+            raise VerificationError(
+                f"{label} exceeds the {maximum_total_bytes}-byte total output limit"
+            )
+        normalized[name] = data
+    _require_unique_casefold(list(normalized), f"{label} output names")
+    if len(normalized) > maximum_file_count:
+        raise VerificationError(
+            f"{label} exceeds the {maximum_file_count}-file output limit"
+        )
+    return MappingProxyType(normalized)
+
+
+def _require_fresh_private_pinned_directory(
+    directory: _PinnedDirectory, label: str
+) -> None:
+    metadata = _fstat(directory.directory_fd, f"{label} directory")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or _object_identity(metadata) != directory.directory_identity
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise VerificationError(
+            f"{label} directory must be owned by the current user with mode 0700"
+        )
+    _bounded_directory_names(directory.directory_fd, 0, f"{label} directory")
+    _require_pinned_directory_path_stable(directory)
+
+
+def _require_exact_created_output_directory(
+    directory: _PinnedDirectory,
+    created_outputs: Sequence[_CreatedOutput],
+    expected_names: Sequence[str],
+    label: str,
+    *,
+    maximum_file_count: int,
+    maximum_file_bytes: int,
+    maximum_total_bytes: int,
+) -> None:
+    directory_before = _fstat(directory.directory_fd, f"{label} directory")
+    if (
+        not stat.S_ISDIR(directory_before.st_mode)
+        or _object_identity(directory_before) != directory.directory_identity
+        or directory_before.st_uid != os.geteuid()
+        or stat.S_IMODE(directory_before.st_mode) != 0o700
+    ):
+        raise VerificationError(
+            f"{label} directory must remain owned by the current user with mode 0700"
+        )
+    expected = sorted(expected_names)
+    if len(expected) > maximum_file_count:
+        raise VerificationError(
+            f"{label} exceeds the {maximum_file_count}-file output limit"
+        )
+    names = _bounded_directory_names(
+        directory.directory_fd, maximum_file_count, label
+    )
+    _require_unique_casefold(names, f"{label} directory")
+    if names != expected:
+        raise VerificationError(
+            f"{label} output set differs from contract; "
+            f"missing={sorted(set(expected) - set(names))}, "
+            f"extra={sorted(set(names) - set(expected))}"
+        )
+    by_name = {created.output.name: created for created in created_outputs}
+    total = 0
+    for name in expected:
+        created = by_name[name]
+        try:
+            visible = os.stat(name, dir_fd=directory.directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise VerificationError(f"cannot inspect {label}/{name}: {error}") from error
+        if visible.st_size > maximum_file_bytes:
+            raise VerificationError(
+                f"{label}/{name} exceeds the {maximum_file_bytes}-byte output limit"
+            )
+        total += visible.st_size
+        if total > maximum_total_bytes:
+            raise VerificationError(
+                f"{label} exceeds the {maximum_total_bytes}-byte total output limit"
+            )
+        if (
+            not stat.S_ISREG(visible.st_mode)
+            or stat.S_ISLNK(visible.st_mode)
+            or stat.S_IMODE(visible.st_mode) != 0o600
+            or visible.st_nlink != 1
+            or _stat_identity(visible) != created.identity
+        ):
+            raise VerificationError(f"{label}/{name} changed before completion")
+    directory_after = _fstat(directory.directory_fd, f"{label} directory")
+    if _stat_identity(directory_before) != _stat_identity(directory_after):
+        raise VerificationError(f"{label} directory changed during final inspection")
+    _require_pinned_directory_path_stable(directory)
+
+
+def _revalidate_exact_output(output: ExactOutput) -> None:
+    """Close one output-side consistency sweep over every held identity."""
+    _require_exact_io_capabilities()
+    components_before = _path_component_identities(
+        output._directory.requested_path,
+        output._directory.resolved_path,
+        output._label,
+    )
+    if components_before != output._path_component_identities:
+        raise VerificationError(f"{output._label} path or ancestor identity changed")
+    _require_exact_created_output_directory(
+        output._directory,
+        output._created_outputs,
+        output.names,
+        output._label,
+        maximum_file_count=output._maximum_file_count,
+        maximum_file_bytes=output._maximum_file_bytes,
+        maximum_total_bytes=output._maximum_total_bytes,
+    )
+    _require_created_outputs_stable(output._created_outputs)
+    components_after = _path_component_identities(
+        output._directory.requested_path,
+        output._directory.resolved_path,
+        output._label,
+    )
+    if components_after != output._path_component_identities:
+        raise VerificationError(f"{output._label} path or ancestor identity changed")
+    _require_exact_created_output_directory(
+        output._directory,
+        output._created_outputs,
+        output.names,
+        output._label,
+        maximum_file_count=output._maximum_file_count,
+        maximum_file_bytes=output._maximum_file_bytes,
+        maximum_total_bytes=output._maximum_total_bytes,
+    )
+
+
+def create_exact_output(
+    directory: Path,
+    files: Mapping[str, bytes],
+    disjoint_from: Sequence[ExactInput],
+    label: str,
+    *,
+    maximum_file_count: int,
+    maximum_file_bytes: int,
+    maximum_total_bytes: int,
+) -> ExactOutput:
+    """Create and pin a budgeted exact output set after all writers terminate.
+
+    The caller and sandbox backend must prevent same-uid concurrent writers and
+    enforce an OS storage quota. This function provides bounded in-process writes
+    and detects drift; it does not claim those external isolation properties.
+    """
+    _require_exact_io_capabilities()
+    normalized = _normalize_exact_output_files(
+        files,
+        label,
+        maximum_file_count=maximum_file_count,
+        maximum_file_bytes=maximum_file_bytes,
+        maximum_total_bytes=maximum_total_bytes,
+    )
+    inputs = tuple(disjoint_from)
+    if any(not isinstance(snapshot, ExactInput) for snapshot in inputs):
+        raise VerificationError(f"{label} disjoint inputs must be ExactInput values")
+    for snapshot in inputs:
+        snapshot.revalidate()
+
+    pinned = _pin_directory(directory, f"{label} directory")
+    created: list[_CreatedOutput] = []
+    succeeded = False
+    try:
+        components_before = _path_component_identities(
+            pinned.requested_path, pinned.resolved_path, label
+        )
+        if any(
+            _directory_is_same_or_descendant(
+                pinned.directory_fd, snapshot._directory.directory_identity
+            )
+            for snapshot in inputs
+        ):
+            raise VerificationError(
+                f"{label} output directory must be disjoint from exact inputs"
+            )
+        _require_fresh_private_pinned_directory(pinned, label)
+        outputs = [
+            _PinnedOutput(
+                requested_directory=pinned.requested_path,
+                directory=pinned.resolved_path,
+                directory_fd=pinned.directory_fd,
+                directory_identity=pinned.directory_identity,
+                name=name,
+                path=pinned.requested_path / name,
+            )
+            for name in sorted(normalized)
+        ]
+        _require_outputs_absent(outputs)
+        for output in outputs:
+            created_output = _write_create_only(
+                output,
+                normalized[output.name],
+                mode=0o600,
+                require_single_link=True,
+                retain_partial_on_failure=True,
+            )
+            try:
+                created.append(created_output)
+            except BaseException:
+                _close_fd(created_output.file_fd)
+                raise
+        try:
+            os.fsync(pinned.directory_fd)
+        except OSError as error:
+            raise VerificationError(f"cannot sync {label} directory: {error}") from error
+        _require_created_outputs_stable(created)
+        _require_exact_created_output_directory(
+            pinned,
+            created,
+            sorted(normalized),
+            label,
+            maximum_file_count=maximum_file_count,
+            maximum_file_bytes=maximum_file_bytes,
+            maximum_total_bytes=maximum_total_bytes,
+        )
+        components_after = _path_component_identities(
+            pinned.requested_path, pinned.resolved_path, label
+        )
+        if components_after != components_before:
+            raise VerificationError(f"{label} path or ancestor changed while writing")
+        for snapshot in inputs:
+            snapshot.revalidate()
+        result = ExactOutput(
+            resolved_path=pinned.resolved_path,
+            names=tuple(sorted(normalized)),
+            _directory=pinned,
+            _created_outputs=tuple(created),
+            _path_component_identities=components_before,
+            _maximum_file_count=maximum_file_count,
+            _maximum_file_bytes=maximum_file_bytes,
+            _maximum_total_bytes=maximum_total_bytes,
+            _label=label,
+        )
+        result.revalidate()
+        succeeded = True
+        return result
+    except VerificationError as error:
+        if created and "retained for fail-closed quarantine" not in str(error):
+            raise VerificationError(
+                f"{error}; output residual retained for fail-closed quarantine"
+            ) from error
+        raise
+    finally:
+        if not succeeded:
+            for created_output in created:
+                _close_fd(created_output.file_fd)
+            _close_pinned_directory(pinned)
 
 
 def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
