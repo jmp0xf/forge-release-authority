@@ -10,6 +10,12 @@ individual workflow file. It becomes usable only after its workflow and platform
 and independently verified. The checked-in workflow is initially a non-release canary; its presence alone does not
 activate this builder identity.
 
+The current Stage A workflow cannot activate this identity. Its dispatch mode has the single value `canary`; the
+finalize, independent-qualification, and protected-attestation jobs each have a checked-in literal-false condition, and
+the native jobs create no builder record or uploadable handoff. The sections below define the dormant v1 contract so it
+can be reviewed, not behavior that a Stage A run can reach. Activation work must use separately reviewed v2 identities,
+policy, records, and verifier rules that reject v1 canary artifacts.
+
 ## Scope and trust base
 
 The builder identity represents the transitive closure of entities trusted to execute the
@@ -46,31 +52,44 @@ x86_64-pc-windows-msvc
 ```
 
 They may read source and upload workflow artifacts. They must not receive an OIDC token, protected environment,
-repository secret, attestation permission, GitHub Release permission, or other publication credential. Each emits one
-binary, one SBOM, and one bounded builder record.
+repository secret, attestation permission, GitHub Release permission, or other publication credential. In the dormant
+v1 contract each would emit one binary, one SBOM, and one bounded builder record. The current Stage A canary builds the
+binary and SBOM only as inputs to its local diagnostic collector; it uploads neither those files nor a builder record.
 
 Each native job provisions the policy-pinned Rust toolchain with both `clippy` and `rustfmt` explicitly installed and
 version-probed before candidate execution. The source gates begin with `cargo fmt --all -- --check`; they do not depend
 on a component that happens to remain in a hosted runner image. Candidate tests retain their project-native parallel
 execution and failure semantics.
 
-For the inactive canary only, each native job also writes and uploads one create-only, target-specific runner
-observation retained for 30 days. The standard-library-only collector bounds command time and output, file hashing,
-directory scans, manifest entries, and final JSON size. It reads only an explicit runner-environment allowlist, replaces
-known workspace/tool-cache/home path prefixes, redacts secret-like assignments, hashes bounded regular files, and
-records unavailable probes rather than inventing values. It records runner image fields, Rust/Cargo/rustup/Git/Python
-versions and executable summaries, target Rust libraries, fresh Cargo registry archives, and available native
+For the inactive canary only, each native job writes and uploads one create-only, target-specific v2 runner observation
+retained for 30 days. The standard-library-only collector bounds command time and output, file hashing, directory
+scans, manifest entries, and final JSON size. It reads only an explicit runner-environment allowlist, replaces known
+workspace/tool-cache/home path prefixes, redacts secret-like assignments, hashes bounded regular files, and records
+unavailable probes rather than inventing values. It records runner image fields, Rust/Cargo/rustup/Git/Python versions
+and executable summaries, target Rust libraries, fresh Cargo registry archives, and available native
 compiler/linker/SDK/runtime diagnostics.
 
-These observations are produced in the same unprivileged job that executes candidate code and are untrusted bootstrap
-diagnostics. They are kept outside the native binary/SBOM/builder-record handoff, are never downloaded by finalize,
-independent qualification, or protected attest, and do not enter the v1 predicate, byproducts, subjects, attestation,
-or qualified evidence. In particular, the Windows outer workflow shell cannot observe the bounded MSVC environment
-that Forge xtask discovers and projects internally; the Windows record states that limitation and does not reconstruct
-or claim an MSVC environment. A future source-side observation, reviewed constraint, or other independent mechanism is
-required to close that gap.
+Forge also writes one target-specific `forge.release-build-input-observation/v1` file immediately before starting its
+Cargo release process. That raw candidate self-report may contain native paths encoded as Base64; Base64 is transport
+encoding, not encryption or redaction. It exists only in a fresh `RUNNER_TEMP` directory. After a successful synchronous
+`release-build` returns, the authority collector first validates the exact source commit, target, Cargo executable,
+ordered 13-argument profile, isolated source and target roots, bounded encodings, and MSVC field shape. It reduces the
+values to fixed profiles, entry counts, and ordered path-root classes, removes the raw namespace, and only then performs
+the slower outer-runner probes. Ordinary failures run the same fixed cleanup through a Bash `EXIT` trap or PowerShell
+`finally`. No upload, cache, handoff, builder record, predicate, or digest includes the raw file or its raw hash.
+
+These observations are produced in the same unprivileged job and operating-system user that executes candidate code.
+The source-side facts remain explicitly marked `candidate-controlled-self-report` and
+`excluded-from-release-evidence`; the sanitizer constrains disclosure and shape, not truth. The Windows outer-shell
+probes remain separate from the candidate-reported classification of Forge's internal bounded MSVC environment. The
+observations are never downloaded by finalize, independent qualification, or protected attest, and do not enter the v1
+predicate, byproducts, subjects, attestation, or qualified evidence. A forced runner termination may bypass shell
+cleanup, so this Stage A design also relies on disposal of the single-use hosted runner and must not be moved to a
+persistent self-hosted runner without a stronger trusted cleanup boundary.
 
 ### Finalize job
+
+This job is present but mechanically unreachable in Stage A.
 
 The finalize job may execute the candidate's `release-finalize` and `release-check` commands and assemble workflow
 artifacts. It has the same unprivileged boundary as native jobs: no OIDC token, protected environment, secret,
@@ -84,8 +103,11 @@ runs the complete verifier over fresh copies of the downloaded files. Neither jo
 protected environment, attestation permission, or release permission. The independent job's predicate and checksums
 are a deterministic preview only: the protected job downloads the original finalized artifacts, reruns the complete
 verifier in new private directories, and requires byte-for-byte equality before attestation.
+The independent job is present but mechanically unreachable in Stage A.
 
 ### Protected attest job
+
+This job is present but mechanically unreachable in Stage A.
 
 Only this job may request an OIDC token and write an attestation. It is gated by the `forge-release` environment and
 must require an explicit owner/legal approval in that protected environment. Chat authorization, candidate text, a PR
@@ -196,19 +218,20 @@ uncertain, consumers must treat the builder as unavailable rather than downgrade
 
 ## SLSA level and limitations
 
-No SLSA Build level is currently claimed. The repository is still bootstrapping: the executable workflow is installed
-only for an inactive canary, signer-builder verification remains a required follow-up, the environment controls require
+No SLSA Build level is currently claimed. The repository is still bootstrapping: the executable workflow is
+mechanically canary-only, signer-builder verification remains a required follow-up, the environment controls require
 final platform verification, and the single-owner topology does not provide independent second-person review. A future
-level claim requires an independent assessment of the deployed platform against the then-current SLSA requirements;
-changing this sentence is not such an assessment.
+level claim requires separately reviewed v2 identities plus an independent assessment of the deployed platform against
+the then-current SLSA requirements; changing this sentence is not such an assessment.
 
 Known scope limits include GitHub-hosted service trust, platform administrators, the approval owner, pinned third-party
 attestation infrastructure, and best-effort completeness of dependencies outside the four qualification inputs. The
 builder-record byproducts describe selected workload facts; they do not prove the hosted runner image, compiler
 wrapper, linker, dependency cache, or every transitive builder dependency unless the deployed workflow records and
-verifies them. Before activation, the non-release canary must capture and the follow-up change must freeze or
+verifies them. Before activation, the non-release canary must capture and the v2 follow-up change must freeze or
 conservatively verify the effective package sources, compiler/linker and SDK inputs, runtime-library allowlist, runner
-image identity, and cache/environment behavior observed on all five native targets.
+image identity, cache/environment behavior, and absence or rejection of unknown path classes observed on all five
+native targets.
 
 ## Versioning
 
