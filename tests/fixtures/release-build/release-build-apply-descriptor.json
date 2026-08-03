@@ -1,0 +1,60 @@
+{
+  "schema": "forge.release-build-apply-descriptor/v1",
+  "purpose": "candidate-apply-input-not-authority-evidence",
+  "plan_sha256": "078fc4023e5f37996f2705fd7c959bf592fdfeca90016a331071c96b7a0b7f39",
+  "binary": {
+    "length": 120,
+    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "sbom_graph": {
+    "root": "workspace:forge-cli@0.1.0-rc.2",
+    "packages": [
+      {
+        "key": "crates-io:build-helper@1.2.3",
+        "name": "build-helper",
+        "version": "1.2.3",
+        "sbom_license_expression": "Apache-2.0 OR MIT",
+        "source": {
+          "kind": "crates-io",
+          "crate_archive_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      {
+        "key": "crates-io:serde@1.0.229",
+        "name": "serde",
+        "version": "1.0.229",
+        "sbom_license_expression": "MIT OR Apache-2.0",
+        "source": {
+          "kind": "crates-io",
+          "crate_archive_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      },
+      {
+        "key": "workspace:forge-cli@0.1.0-rc.2",
+        "name": "forge-cli",
+        "version": "0.1.0-rc.2",
+        "sbom_license_expression": "MIT OR Apache-2.0",
+        "source": {
+          "kind": "workspace"
+        }
+      }
+    ],
+    "dependencies": [
+      {
+        "package": "crates-io:build-helper@1.2.3",
+        "depends_on": []
+      },
+      {
+        "package": "crates-io:serde@1.0.229",
+        "depends_on": []
+      },
+      {
+        "package": "workspace:forge-cli@0.1.0-rc.2",
+        "depends_on": [
+          "crates-io:build-helper@1.2.3",
+          "crates-io:serde@1.0.229"
+        ]
+      }
+    ]
+  }
+}

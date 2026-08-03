@@ -1,0 +1,79 @@
+{
+  "packages": [
+    {
+      "id": "path+file:///authority/source/crates/forge-cli#0.1.0-rc.2",
+      "name": "forge-cli",
+      "version": "0.1.0-rc.2",
+      "license": "MIT OR Apache-2.0",
+      "source": null,
+      "manifest_path": "/authority/source/crates/forge-cli/Cargo.toml",
+      "targets": [
+        {
+          "kind": ["bin"],
+          "crate_types": ["bin"],
+          "name": "forge",
+          "src_path": "/authority/source/crates/forge-cli/src/main.rs"
+        }
+      ]
+    },
+    {
+      "id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229",
+      "name": "serde",
+      "version": "1.0.229",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "manifest_path": "/authority/cargo/registry/src/serde-1.0.229/Cargo.toml",
+      "targets": [
+        {
+          "kind": ["lib"],
+          "crate_types": ["lib"],
+          "name": "serde",
+          "src_path": "/authority/cargo/registry/src/serde-1.0.229/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "id": "registry+https://github.com/rust-lang/crates.io-index#build-helper@1.2.3",
+      "name": "build-helper",
+      "version": "1.2.3",
+      "license": "Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "manifest_path": "/authority/cargo/registry/src/build-helper-1.2.3/Cargo.toml",
+      "targets": [
+        {
+          "kind": ["lib"],
+          "crate_types": ["lib"],
+          "name": "build_helper",
+          "src_path": "/authority/cargo/registry/src/build-helper-1.2.3/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "id": "registry+https://github.com/rust-lang/crates.io-index#test-only@4.5.6",
+      "name": "test-only",
+      "version": "4.5.6",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "manifest_path": "/authority/cargo/registry/src/test-only-4.5.6/Cargo.toml",
+      "targets": [
+        {
+          "kind": ["lib"],
+          "crate_types": ["lib"],
+          "name": "test_only",
+          "src_path": "/authority/cargo/registry/src/test-only-4.5.6/src/lib.rs"
+        }
+      ]
+    }
+  ],
+  "workspace_members": [
+    "path+file:///authority/source/crates/forge-cli#0.1.0-rc.2"
+  ],
+  "workspace_default_members": [
+    "path+file:///authority/source/crates/forge-cli#0.1.0-rc.2"
+  ],
+  "resolve": null,
+  "target_directory": "/authority/target",
+  "version": 1,
+  "workspace_root": "/authority/source",
+  "metadata": null
+}
