@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import ntpath
 import os
 import tempfile
 import unittest
@@ -140,8 +141,11 @@ def _windows_document() -> tuple[dict[str, object], dict[str, str], dict[str, st
     return document, paths, environment
 
 
-def _sanitize_windows(document: dict[str, object]) -> dict[str, object]:
+def _sanitize_windows(
+    document: dict[str, object], *, path_overrides: dict[str, str] | None = None
+) -> dict[str, object]:
     _, paths, environment = _windows_document()
+    paths.update(path_overrides or {})
     return sanitizer.sanitize_document(
         document,
         target=WINDOWS_TARGET,
@@ -230,7 +234,7 @@ class BuildInputSanitizerTests(unittest.TestCase):
                 self.assertNotIn(private_value, rendered)
 
     def test_exact_command_and_source_contract_fail_closed(self) -> None:
-        document, _, _ = _windows_document()
+        document, paths, _ = _windows_document()
         mutations = (
             ("extra root key", lambda value: value.__setitem__("extra", True)),
             (
@@ -263,6 +267,15 @@ class BuildInputSanitizerTests(unittest.TestCase):
                     -1, _windows_native(r"D:\\outside\\target")
                 ),
             ),
+            (
+                "normalized Cargo alias",
+                lambda value: value["cargo_command"].__setitem__(
+                    "program",
+                    _windows_native(
+                        ntpath.join(ntpath.dirname(paths["cargo"]), "bin", "..", "cargo.exe")
+                    ),
+                ),
+            ),
         )
         for label, mutate in mutations:
             with self.subTest(label=label):
@@ -270,6 +283,18 @@ class BuildInputSanitizerTests(unittest.TestCase):
                 mutate(changed)
                 with self.assertRaises(sanitizer.SanitizationError):
                     _sanitize_windows(changed)
+
+        for label, build_temp in (
+            ("outside runner temp", r"D:\\outside"),
+            ("contains source checkout", paths["source"]),
+            ("equals raw namespace", paths["raw"]),
+        ):
+            with self.subTest(build_temp=label):
+                with self.assertRaises(sanitizer.SanitizationError):
+                    _sanitize_windows(
+                        copy.deepcopy(document),
+                        path_overrides={"build_temp": build_temp},
+                    )
 
     def test_json_numbers_are_rejected_without_parser_details(self) -> None:
         for raw in (b'{"unexpected":1}', b'{"unexpected":1.5}', b'{"unexpected":NaN}'):
@@ -311,6 +336,22 @@ class BuildInputSanitizerTests(unittest.TestCase):
         windows = summary["reported_windows_msvc_environment"]
         assert isinstance(windows, dict)
         self.assertEqual(windows["path"]["root_classes"], ["other-absolute"])
+
+        document, _, _ = _windows_document()
+        document["windows_msvc_environment"]["path"] = _windows_native(
+            ";".join(
+                (
+                    r"C:\Windows\System32",
+                    r"C:\Windows",
+                    r"C:\Windows\System32",
+                )
+            ),
+            "windows-utf16le-base64",
+        )
+        summary = _sanitize_windows(document)
+        windows = summary["reported_windows_msvc_environment"]
+        assert isinstance(windows, dict)
+        self.assertEqual(windows["path"]["root_classes"], ["system"] * 3)
 
     def test_native_decoding_rejects_noncanonical_nul_odd_and_oversize_values(self) -> None:
         document, _, _ = _windows_document()
