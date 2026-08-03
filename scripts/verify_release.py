@@ -21,12 +21,22 @@ import re
 import stat
 import struct
 import sys
+import threading
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Iterator, Mapping, Sequence, cast
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    Mapping,
+    NoReturn,
+    Sequence,
+    SupportsIndex,
+    cast,
+)
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -132,6 +142,143 @@ class VerificationError(ValueError):
     """An input did not satisfy the frozen qualification contract."""
 
 
+_EXACT_IO_CONSTRUCTION_TOKEN = object()
+_EXACT_IO_LIVE = "live"
+_EXACT_IO_CLOSING = "closing"
+_EXACT_IO_CLOSED = "closed"
+
+
+class _ExactIoCloseAttempt:
+    """Whether fd cleanup crossed the point after which retry is unsafe."""
+
+    __slots__ = ("started",)
+
+    def __init__(self) -> None:
+        self.started = False
+
+
+class _ExactIoLifetime:
+    """Owner-bound state granting at most one thread permission to close fds."""
+
+    __slots__ = ("_active_depth", "_active_thread", "_lock", "_owner", "_state")
+
+    def __init__(self, construction_token: object) -> None:
+        if construction_token is not _EXACT_IO_CONSTRUCTION_TOKEN:
+            raise TypeError("exact I/O lifetimes are backend-created only")
+        self._active_depth = 0
+        self._active_thread: int | None = None
+        self._lock = threading.RLock()
+        self._owner: object | None = None
+        self._state = _EXACT_IO_LIVE
+
+    def bind(self, owner: object, construction_token: object) -> None:
+        """Bind this lifetime exactly once to its backend-created resource."""
+        if construction_token is not _EXACT_IO_CONSTRUCTION_TOKEN:
+            raise TypeError("exact I/O lifetimes are backend-created only")
+        with self._lock:
+            if self._owner is not None:
+                raise TypeError("exact I/O lifetime already has an owner")
+            self._owner = owner
+
+    def owns(self, owner: object) -> bool:
+        with self._lock:
+            return self._owner is owner
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._state != _EXACT_IO_LIVE
+
+    @contextmanager
+    def operation(self, owner: object, label: str) -> Iterator[None]:
+        """Exclude close while one owner-validated fd operation is in progress."""
+        with self._lock:
+            if self._owner is not owner:
+                raise VerificationError(f"{label} has invalid resource ownership")
+            if self._state != _EXACT_IO_LIVE:
+                raise VerificationError(f"{label} is already closed")
+            current_thread = threading.get_ident()
+            if self._active_depth == 0:
+                self._active_thread = current_thread
+            elif self._active_thread != current_thread:
+                raise VerificationError(f"{label} has inconsistent operation ownership")
+            self._active_depth += 1
+            try:
+                yield
+            finally:
+                self._active_depth -= 1
+                if self._active_depth == 0:
+                    self._active_thread = None
+
+    def close_with(
+        self,
+        owner: object,
+        label: str,
+        cleanup: Callable[[_ExactIoCloseAttempt], None],
+    ) -> bool:
+        """Grant one close attempt and classify interruption by cleanup progress.
+
+        An interruption before cleanup starts restores LIVE because no fd was
+        attempted. After cleanup starts, any interruption permanently leaves the
+        resource CLOSED: later fds might remain open, so the Authority must discard
+        the process rather than retry and risk closing reused fd numbers.
+        """
+        with self._lock:
+            if self._owner is not owner:
+                raise VerificationError(f"{label} has invalid resource ownership")
+            if self._active_depth > 0 and self._active_thread == threading.get_ident():
+                raise VerificationError(
+                    f"{label} cannot close during an active operation"
+                )
+            if self._state == _EXACT_IO_CLOSED:
+                return False
+            if self._state == _EXACT_IO_CLOSING:
+                raise VerificationError(f"{label} close is already in progress")
+            attempt = _ExactIoCloseAttempt()
+            try:
+                self._state = _EXACT_IO_CLOSING
+                cleanup(attempt)
+                self._state = _EXACT_IO_CLOSED
+            except BaseException:
+                self._state = _EXACT_IO_CLOSED if attempt.started else _EXACT_IO_LIVE
+                raise
+            return True
+
+
+class _OpaqueExactIoResource:
+    """Read-only, non-constructible handle for live fd ownership."""
+
+    __slots__ = ()
+    _resource_kind = "exact I/O resource"
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        raise TypeError(f"opaque {self._resource_kind} cannot be constructed directly")
+
+    def __setattr__(self, _name: str, _value: object) -> NoReturn:
+        raise TypeError(f"opaque {self._resource_kind} is read-only")
+
+    def __delattr__(self, _name: str) -> NoReturn:
+        raise TypeError(f"opaque {self._resource_kind} is read-only")
+
+    def _reject_copy_or_serialization(self) -> NoReturn:
+        raise TypeError(f"opaque {self._resource_kind} cannot be copied or serialized")
+
+    def __copy__(self) -> NoReturn:
+        self._reject_copy_or_serialization()
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> NoReturn:
+        self._reject_copy_or_serialization()
+
+    def __reduce__(self) -> NoReturn:
+        self._reject_copy_or_serialization()
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> NoReturn:
+        self._reject_copy_or_serialization()
+
+    def __replace__(self, /, **_changes: Any) -> NoReturn:
+        self._reject_copy_or_serialization()
+
+
 @dataclass(frozen=True)
 class _PinnedDirectory:
     """A directory whose actual inode is held independently of later path changes."""
@@ -168,9 +315,23 @@ class _CreatedOutput:
     require_single_link: bool
 
 
-@dataclass(frozen=True)
-class ExactInput:
+class ExactInput(_OpaqueExactIoResource):
     """An immutable exact-directory snapshot backed by a held directory fd."""
+
+    __slots__ = (
+        "files",
+        "resolved_path",
+        "_directory",
+        "_limits_by_name",
+        "_total_limit",
+        "_label",
+        "_directory_identity",
+        "_entry_identities",
+        "_path_component_identities",
+        "_content_sha256",
+        "_lifetime",
+    )
+    _resource_kind = "input"
 
     files: Mapping[str, bytes]
     resolved_path: Path
@@ -182,23 +343,41 @@ class ExactInput:
     _entry_identities: Mapping[str, StatIdentity]
     _path_component_identities: tuple[tuple[str, str, ObjectIdentity], ...]
     _content_sha256: Mapping[str, str]
-    _closed: bool = False
+    _lifetime: _ExactIoLifetime
+
+    def __init_subclass__(cls, **_kwargs: Any) -> NoReturn:
+        raise TypeError("opaque ExactInput cannot be subclassed")
+
+    @property
+    def _closed(self) -> bool:
+        return _require_exact_input_owner(self).closed
 
     def revalidate(self, rehash: bool = True) -> None:
         """Reject any path, identity, exact-set, or optional content drift."""
-        if self._closed:
-            raise VerificationError(f"{self._label} input is already closed")
         _revalidate_exact_input(self, rehash=rehash)
 
 
-@dataclass(frozen=True)
-class ExactOutput:
+class ExactOutput(_OpaqueExactIoResource):
     """Pinned exact outputs for consumption by the next Authority phase.
 
     The sandbox backend must keep every external writer terminated while this
     object is alive. POSIX file descriptors detect name and identity drift but
     cannot by themselves exclude a concurrent process with the same uid.
     """
+
+    __slots__ = (
+        "resolved_path",
+        "names",
+        "_directory",
+        "_created_outputs",
+        "_path_component_identities",
+        "_maximum_file_count",
+        "_maximum_file_bytes",
+        "_maximum_total_bytes",
+        "_label",
+        "_lifetime",
+    )
+    _resource_kind = "output"
 
     resolved_path: Path
     names: tuple[str, ...]
@@ -209,7 +388,14 @@ class ExactOutput:
     _maximum_file_bytes: int
     _maximum_total_bytes: int
     _label: str
-    _closed: bool = False
+    _lifetime: _ExactIoLifetime
+
+    def __init_subclass__(cls, **_kwargs: Any) -> NoReturn:
+        raise TypeError("opaque ExactOutput cannot be subclassed")
+
+    @property
+    def _closed(self) -> bool:
+        return _require_exact_output_owner(self).closed
 
     def revalidate(self) -> None:
         """Recheck held fds, visible names, identities, bytes, and budgets."""
@@ -219,16 +405,17 @@ class ExactOutput:
 
     def close(self) -> None:
         """Release held output fds without deleting any visible filesystem name."""
-        if self._closed:
-            return
-        for created in self._created_outputs:
-            _close_fd(created.file_fd)
-        _close_pinned_directory(self._directory)
-        object.__setattr__(self, "_closed", True)
+        lifetime = _require_exact_output_owner(self)
+
+        def cleanup(attempt: _ExactIoCloseAttempt) -> None:
+            _close_exact_io_fds_once(attempt, self._created_outputs, self._directory)
+
+        lifetime.close_with(self, f"{self._label} output", cleanup)
 
     def __enter__(self) -> ExactOutput:
-        if self._closed:
-            raise VerificationError(f"{self._label} output is already closed")
+        lifetime = _require_exact_output_owner(self)
+        with lifetime.operation(self, f"{self._label} output"):
+            pass
         return self
 
     def __exit__(
@@ -242,6 +429,89 @@ class ExactOutput:
                 self.revalidate()
         finally:
             self.close()
+
+
+def _require_exact_io_owner(
+    resource: object, expected_type: type[object], kind: str
+) -> _ExactIoLifetime:
+    """Reject subclasses, hand-built objects, and detached lifetime tokens."""
+    if type(resource) is not expected_type:
+        raise VerificationError(f"exact {kind} must have its exact backend type")
+    try:
+        lifetime = object.__getattribute__(resource, "_lifetime")
+    except AttributeError as error:
+        raise VerificationError(
+            f"exact {kind} has invalid resource ownership"
+        ) from error
+    if type(lifetime) is not _ExactIoLifetime or not lifetime.owns(resource):
+        raise VerificationError(f"exact {kind} has invalid resource ownership")
+    return lifetime
+
+
+def _require_exact_input_owner(resource: object) -> _ExactIoLifetime:
+    return _require_exact_io_owner(resource, ExactInput, "input")
+
+
+def _require_exact_output_owner(resource: object) -> _ExactIoLifetime:
+    return _require_exact_io_owner(resource, ExactOutput, "output")
+
+
+def _new_exact_input(
+    *,
+    files: Mapping[str, bytes],
+    resolved_path: Path,
+    directory: _PinnedDirectory,
+    limits_by_name: Mapping[str, int],
+    total_limit: int,
+    label: str,
+    directory_identity: StatIdentity,
+    entry_identities: Mapping[str, StatIdentity],
+    path_component_identities: tuple[tuple[str, str, ObjectIdentity], ...],
+    content_sha256: Mapping[str, str],
+) -> ExactInput:
+    result = object.__new__(ExactInput)
+    lifetime = _ExactIoLifetime(_EXACT_IO_CONSTRUCTION_TOKEN)
+    object.__setattr__(result, "files", files)
+    object.__setattr__(result, "resolved_path", resolved_path)
+    object.__setattr__(result, "_directory", directory)
+    object.__setattr__(result, "_limits_by_name", limits_by_name)
+    object.__setattr__(result, "_total_limit", total_limit)
+    object.__setattr__(result, "_label", label)
+    object.__setattr__(result, "_directory_identity", directory_identity)
+    object.__setattr__(result, "_entry_identities", entry_identities)
+    object.__setattr__(result, "_path_component_identities", path_component_identities)
+    object.__setattr__(result, "_content_sha256", content_sha256)
+    lifetime.bind(result, _EXACT_IO_CONSTRUCTION_TOKEN)
+    object.__setattr__(result, "_lifetime", lifetime)
+    return result
+
+
+def _new_exact_output(
+    *,
+    resolved_path: Path,
+    names: tuple[str, ...],
+    directory: _PinnedDirectory,
+    created_outputs: tuple[_CreatedOutput, ...],
+    path_component_identities: tuple[tuple[str, str, ObjectIdentity], ...],
+    maximum_file_count: int,
+    maximum_file_bytes: int,
+    maximum_total_bytes: int,
+    label: str,
+) -> ExactOutput:
+    result = object.__new__(ExactOutput)
+    lifetime = _ExactIoLifetime(_EXACT_IO_CONSTRUCTION_TOKEN)
+    object.__setattr__(result, "resolved_path", resolved_path)
+    object.__setattr__(result, "names", names)
+    object.__setattr__(result, "_directory", directory)
+    object.__setattr__(result, "_created_outputs", created_outputs)
+    object.__setattr__(result, "_path_component_identities", path_component_identities)
+    object.__setattr__(result, "_maximum_file_count", maximum_file_count)
+    object.__setattr__(result, "_maximum_file_bytes", maximum_file_bytes)
+    object.__setattr__(result, "_maximum_total_bytes", maximum_total_bytes)
+    object.__setattr__(result, "_label", label)
+    lifetime.bind(result, _EXACT_IO_CONSTRUCTION_TOKEN)
+    object.__setattr__(result, "_lifetime", lifetime)
+    return result
 
 
 @dataclass(frozen=True)
@@ -344,6 +614,30 @@ def _close_fd(file_fd: int) -> None:
         os.close(file_fd)
     except OSError:
         pass
+
+
+def _close_exact_io_fds_once(
+    attempt: _ExactIoCloseAttempt,
+    created_outputs: Sequence[_CreatedOutput],
+    directory: _PinnedDirectory,
+) -> None:
+    attempt.started = True
+    # Repeated asynchronous interruption after this boundary can strand later fds.
+    # Never retry in-process: the Authority must fail closed and discard the process.
+    first_error: BaseException | None = None
+    for created in created_outputs:
+        try:
+            _close_fd(created.file_fd)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    try:
+        _close_pinned_directory(directory)
+    except BaseException as error:
+        if first_error is None:
+            first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def _directory_open_flags() -> int:
@@ -1487,6 +1781,12 @@ def _inspect_exact_pinned_directory(
 
 
 def _revalidate_exact_input(snapshot: ExactInput, *, rehash: bool) -> None:
+    lifetime = _require_exact_input_owner(snapshot)
+    with lifetime.operation(snapshot, f"{snapshot._label} input"):
+        _revalidate_exact_input_open(snapshot, rehash=rehash)
+
+
+def _revalidate_exact_input_open(snapshot: ExactInput, *, rehash: bool) -> None:
     if not isinstance(rehash, bool):
         raise VerificationError(f"{snapshot._label} rehash must be a boolean")
     components_before = _path_component_identities(
@@ -1561,17 +1861,17 @@ def open_exact_input(
         )
         if components_before != components_after:
             raise VerificationError(f"{label} path or ancestor changed while opening")
-        snapshot = ExactInput(
+        snapshot = _new_exact_input(
             files=MappingProxyType(files),
             resolved_path=pinned.resolved_path,
-            _directory=pinned,
-            _limits_by_name=limits,
-            _total_limit=total_limit,
-            _label=label,
-            _directory_identity=directory_identity,
-            _entry_identities=entry_identities,
-            _path_component_identities=components_after,
-            _content_sha256=MappingProxyType(
+            directory=pinned,
+            limits_by_name=limits,
+            total_limit=total_limit,
+            label=label,
+            directory_identity=directory_identity,
+            entry_identities=entry_identities,
+            path_component_identities=components_after,
+            content_sha256=MappingProxyType(
                 {name: _sha256(data) for name, data in files.items()}
             ),
         )
@@ -1582,9 +1882,15 @@ def open_exact_input(
         else:
             snapshot.revalidate()
     finally:
-        if snapshot is not None:
-            object.__setattr__(snapshot, "_closed", True)
-        _close_pinned_directory(pinned)
+        if snapshot is None:
+            _close_exact_io_fds_once(_ExactIoCloseAttempt(), (), pinned)
+        else:
+            lifetime = _require_exact_input_owner(snapshot)
+
+            def cleanup(attempt: _ExactIoCloseAttempt) -> None:
+                _close_exact_io_fds_once(attempt, (), pinned)
+
+            lifetime.close_with(snapshot, f"{label} input", cleanup)
 
 
 def _read_regular_file_at(
@@ -3268,6 +3574,12 @@ def _require_exact_created_output_directory(
 
 def _revalidate_exact_output(output: ExactOutput) -> None:
     """Close one output-side consistency sweep over every held identity."""
+    lifetime = _require_exact_output_owner(output)
+    with lifetime.operation(output, f"{output._label} output"):
+        _revalidate_exact_output_open(output)
+
+
+def _revalidate_exact_output_open(output: ExactOutput) -> None:
     _require_exact_io_capabilities()
     components_before = _path_component_identities(
         output._directory.requested_path,
@@ -3329,13 +3641,15 @@ def create_exact_output(
         maximum_total_bytes=maximum_total_bytes,
     )
     inputs = tuple(disjoint_from)
-    if any(not isinstance(snapshot, ExactInput) for snapshot in inputs):
+    if any(type(snapshot) is not ExactInput for snapshot in inputs):
         raise VerificationError(f"{label} disjoint inputs must be ExactInput values")
     for snapshot in inputs:
+        _require_exact_input_owner(snapshot)
         snapshot.revalidate()
 
     pinned = _pin_directory(directory, f"{label} directory")
     created: list[_CreatedOutput] = []
+    result: ExactOutput | None = None
     succeeded = False
     try:
         components_before = _path_component_identities(
@@ -3397,16 +3711,16 @@ def create_exact_output(
             raise VerificationError(f"{label} path or ancestor changed while writing")
         for snapshot in inputs:
             snapshot.revalidate()
-        result = ExactOutput(
+        result = _new_exact_output(
             resolved_path=pinned.resolved_path,
             names=tuple(sorted(normalized)),
-            _directory=pinned,
-            _created_outputs=tuple(created),
-            _path_component_identities=components_before,
-            _maximum_file_count=maximum_file_count,
-            _maximum_file_bytes=maximum_file_bytes,
-            _maximum_total_bytes=maximum_total_bytes,
-            _label=label,
+            directory=pinned,
+            created_outputs=tuple(created),
+            path_component_identities=components_before,
+            maximum_file_count=maximum_file_count,
+            maximum_file_bytes=maximum_file_bytes,
+            maximum_total_bytes=maximum_total_bytes,
+            label=label,
         )
         result.revalidate()
         succeeded = True
@@ -3419,9 +3733,15 @@ def create_exact_output(
         raise
     finally:
         if not succeeded:
-            for created_output in created:
-                _close_fd(created_output.file_fd)
-            _close_pinned_directory(pinned)
+            if result is None:
+                _close_exact_io_fds_once(_ExactIoCloseAttempt(), created, pinned)
+            else:
+                lifetime = _require_exact_output_owner(result)
+
+                def cleanup(attempt: _ExactIoCloseAttempt) -> None:
+                    _close_exact_io_fds_once(attempt, created, pinned)
+
+                lifetime.close_with(result, f"{label} output", cleanup)
 
 
 def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
