@@ -87,6 +87,7 @@ class FakeOperations:
         self.apply_capture = object()
         self.plan_xtask: sandbox.SandboxPhaseCapture[object] | None = None
         self.apply_xtask: sandbox.SandboxPhaseCapture[object] | None = None
+        self.target_check: driver.CanaryTargetCheck | None = None
 
     def _enter(
         self, name: str, phase: sandbox.Phase, permit: sandbox.SandboxPermit
@@ -152,12 +153,17 @@ class FakeOperations:
             raise RuntimeError("apply input identity changed")
         return self._capture("apply", sandbox.Phase.APPLY, permit, self.apply_capture)
 
-    def verify_target(self, apply_capture: sandbox.SandboxPhaseCapture[object]) -> None:
+    def verify_target(
+        self, apply_capture: sandbox.SandboxPhaseCapture[object]
+    ) -> driver.CanaryTargetCheck:
         self.events.append("operation:verify-target")
         if self.fail_operation == "verify-target":
             raise RuntimeError("fake verification failure")
         if apply_capture.value is not self.apply_capture:
             raise RuntimeError("apply capture identity changed")
+        check = driver.canary_target_checked(apply_capture)
+        self.target_check = check
+        return check
 
 
 class ReentrantOperations(FakeOperations):
@@ -186,6 +192,31 @@ class BypassOperations(FakeOperations):
     ) -> sandbox.SandboxProvisionalCapture[object]:
         self._enter("bootstrap", sandbox.Phase.BOOTSTRAP, permit)
         return object()  # type: ignore[return-value]
+
+
+class NoopTargetCheckOperations(FakeOperations):
+    def verify_target(
+        self, apply_capture: sandbox.SandboxPhaseCapture[object]
+    ) -> driver.CanaryTargetCheck:
+        del apply_capture
+        return None  # type: ignore[return-value]
+
+
+class StaleTargetCheckOperations(FakeOperations):
+    def __init__(
+        self,
+        events: list[str],
+        backend: FakeBackend,
+        stale_check: driver.CanaryTargetCheck,
+    ) -> None:
+        super().__init__(events, backend)
+        self.stale_check = stale_check
+
+    def verify_target(
+        self, apply_capture: sandbox.SandboxPhaseCapture[object]
+    ) -> driver.CanaryTargetCheck:
+        del apply_capture
+        return self.stale_check
 
 
 class ReleaseDriverTests(unittest.TestCase):
@@ -253,6 +284,17 @@ class ReleaseDriverTests(unittest.TestCase):
         self.assertFalse(report.qualification_eligible)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             setattr(report, "qualification_eligible", True)
+        self.assertIsNotNone(operations.target_check)
+        assert operations.target_check is not None
+        with self.assertRaises(TypeError):
+            copy.copy(operations.target_check)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(operations.target_check)
+        with self.assertRaises(TypeError):
+            pickle.dumps(operations.target_check)
+        assert operations.plan_xtask is not None
+        with self.assertRaises(driver.DriverError):
+            driver.canary_target_checked(operations.plan_xtask)
 
     def test_permits_are_live_session_bound_and_never_created_from_json(self) -> None:
         events: list[str] = []
@@ -573,6 +615,41 @@ class ReleaseDriverTests(unittest.TestCase):
                 "close:bootstrap",
             ],
         )
+
+    def test_noop_target_check_cannot_produce_a_canary_report(self) -> None:
+        events: list[str] = []
+        backend = FakeBackend(events)
+        canary = driver.CanaryDriver(
+            backend=backend,
+            operations=NoopTargetCheckOperations(events, backend),
+        )
+
+        with self.assertRaises(driver.DriverDiscardedError):
+            canary.run()
+
+        self.assertEqual(canary.state, driver.DriverState.DISCARDED)
+        self.assertIsNone(canary.report)
+        self.assertEqual(events[-1], "close:apply")
+
+    def test_stale_target_check_cannot_validate_another_apply_capture(self) -> None:
+        first_events: list[str] = []
+        first_backend = FakeBackend(first_events)
+        first_operations = FakeOperations(first_events, first_backend)
+        driver.CanaryDriver(backend=first_backend, operations=first_operations).run()
+        assert first_operations.target_check is not None
+
+        events: list[str] = []
+        backend = FakeBackend(events)
+        canary = driver.CanaryDriver(
+            backend=backend,
+            operations=StaleTargetCheckOperations(
+                events, backend, first_operations.target_check
+            ),
+        )
+        with self.assertRaises(driver.DriverDiscardedError):
+            canary.run()
+        self.assertEqual(canary.state, driver.DriverState.DISCARDED)
+        self.assertIsNone(canary.report)
 
     def test_callback_reentry_irreversibly_discards_without_a_report(self) -> None:
         events: list[str] = []
