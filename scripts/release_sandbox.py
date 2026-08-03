@@ -14,7 +14,7 @@ import copy
 import json
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
     Any,
@@ -53,6 +53,15 @@ class Phase(str, Enum):
     PLAN = "plan"
     EXECUTE = "execute"
     APPLY = "apply"
+
+
+@dataclass(frozen=True, slots=True)
+class PhasePolicyBinding:
+    """Exact static policy identity, not a capability or enforcement claim."""
+
+    schema: str
+    phase: Phase
+    canonical_bytes: bytes = field(repr=False)
 
 
 class BackendUnavailableReason(str, Enum):
@@ -326,6 +335,55 @@ def parse_phase_policy(
     if expected_phase is not None and selected is not _coerce_phase(expected_phase):
         raise SandboxContractError("sandbox phase policy has the wrong phase")
     return cast(dict[str, Any], value)
+
+
+def bind_phase_policy(value: Any) -> PhasePolicyBinding:
+    """Bind one exact versioned policy without granting live authority."""
+    try:
+        canonical_bytes = render_canonical_json(value)
+        policy = parse_canonical_json(canonical_bytes)
+    except (RuntimeError, SandboxContractError):
+        raise SandboxContractError(
+            "sandbox phase policy has an unexpected structure"
+        ) from None
+    if type(policy) is not dict:
+        raise SandboxContractError("sandbox phase policy has an unexpected structure")
+    schema = policy.get("schema")
+    if type(schema) is not str:
+        raise SandboxContractError("sandbox policy schema is outside the closed enum")
+    if schema == PHASE_POLICY_SCHEMA:
+        selected = validate_phase_policy(policy)
+        return PhasePolicyBinding(
+            schema=PHASE_POLICY_SCHEMA,
+            phase=selected,
+            canonical_bytes=canonical_bytes,
+        )
+    raise SandboxContractError("sandbox policy schema is outside the closed enum")
+
+
+def _require_phase_policy_binding(value: Any) -> PhasePolicyBinding:
+    """Rebuild an exact supported binding so callers cannot smuggle state."""
+    if type(value) is not PhasePolicyBinding:
+        raise SandboxContractError("sandbox phase policy binding is invalid")
+    if type(value.schema) is not str:
+        raise SandboxContractError("sandbox policy schema is outside the closed enum")
+    if value.schema == PHASE_POLICY_SCHEMA:
+        if type(value.phase) is not Phase or type(value.canonical_bytes) is not bytes:
+            raise SandboxContractError("sandbox phase policy binding is invalid")
+        try:
+            policy = parse_phase_policy(
+                value.canonical_bytes,
+                expected_phase=value.phase,
+            )
+            rebuilt = bind_phase_policy(policy)
+        except SandboxContractError:
+            raise SandboxContractError(
+                "sandbox phase policy binding is invalid"
+            ) from None
+        if value != rebuilt:
+            raise SandboxContractError("sandbox phase policy binding is invalid")
+        return rebuilt
+    raise SandboxContractError("sandbox policy schema is outside the closed enum")
 
 
 def validate_capability_observation(
@@ -716,14 +774,16 @@ class SandboxPermit:
 
 
 class SandboxSession:
-    """One non-serializable Authority backend capability.
+    """One non-serializable Authority backend lifecycle capability.
 
-    The session binds the exact immutable phase policy, issues one permit, and
-    invalidates that permit before cleanup starts.  A candidate observation is
+    The session records the backend's exact policy-binding claim, issues one
+    permit, and invalidates that permit before cleanup starts.  It does not
+    observe or independently prove OS enforcement.  A candidate observation is
     merely a dictionary and cannot satisfy this live-object contract.
     """
 
     __slots__ = (
+        "__binding",
         "__cleanup",
         "__execution_result",
         "__lock",
@@ -731,7 +791,6 @@ class SandboxSession:
         "__permit",
         "__phase",
         "__poisoned",
-        "__policy_bytes",
         "__provisional",
         "__state",
     )
@@ -740,23 +799,20 @@ class SandboxSession:
         self,
         constructor_key: object,
         owner: AuthoritySandboxBackend,
-        phase: Phase,
-        policy: dict[str, Any],
+        binding: PhasePolicyBinding,
         cleanup: Callable[[], CleanupStatus],
     ) -> None:
         if constructor_key is not _SESSION_CONSTRUCTOR_KEY:
             raise SandboxContractError("sandbox sessions are backend-issued only")
-        selected = validate_phase_policy(policy)
-        if selected is not phase:
-            raise SandboxContractError("sandbox session has the wrong phase policy")
+        validated_binding = _require_phase_policy_binding(binding)
+        self.__binding = validated_binding
         self.__cleanup: Callable[[], CleanupStatus] | None = cleanup
         self.__execution_result: SandboxExecutionResult[object] | None = None
         self.__lock = threading.RLock()
         self.__owner = owner
         self.__permit: SandboxPermit | None = None
-        self.__phase = phase
+        self.__phase = validated_binding.phase
         self.__poisoned = False
-        self.__policy_bytes = render_phase_policy(phase)
         self.__provisional: SandboxProvisionalCapture[object] | None = None
         self.__state = _SESSION_IDLE
 
@@ -779,7 +835,7 @@ class SandboxSession:
         raise TypeError("sandbox sessions cannot be serialized")
 
     def require_policy(self, policy: dict[str, Any]) -> None:
-        """Check that this live capability enforces the requested fixed policy."""
+        """Check this live session's backend-declared exact policy binding."""
         with self.__lock:
             if (
                 self.__state
@@ -790,11 +846,16 @@ class SandboxSession:
                     _SESSION_CAPTURED,
                 )
                 or self.__poisoned
-                or render_canonical_json(policy) != self.__policy_bytes
             ):
                 raise SandboxContractError("sandbox session policy is not active")
-            if validate_phase_policy(policy) is not self.__phase:
-                raise SandboxContractError("sandbox session has the wrong phase")
+            try:
+                requested = bind_phase_policy(policy)
+            except SandboxContractError:
+                raise SandboxContractError(
+                    "sandbox session policy is not active"
+                ) from None
+            if requested != self.__binding:
+                raise SandboxContractError("sandbox session policy is not active")
 
     def issue_permit(self) -> SandboxPermit:
         with self.__lock:
@@ -981,6 +1042,18 @@ class SandboxSession:
                 and not self.__poisoned
             )
 
+    def _is_pristine_and_bound_to(
+        self, owner: AuthoritySandboxBackend, binding: PhasePolicyBinding
+    ) -> bool:
+        with self.__lock:
+            return (
+                self.__owner is owner
+                and self.__binding == binding
+                and self.__state is _SESSION_IDLE
+                and self.__permit is None
+                and not self.__poisoned
+            )
+
 
 _SESSION_CONSTRUCTOR_KEY = object()
 
@@ -998,15 +1071,15 @@ class AuthoritySandboxBackend(ABC):
         self, *, phase: Phase | str, policy: dict[str, Any]
     ) -> SandboxSession:
         selected = _coerce_phase(phase)
-        if validate_phase_policy(policy) is not selected:
+        binding = bind_phase_policy(policy)
+        if binding.phase is not selected:
             raise SandboxContractError("sandbox backend received the wrong policy")
-        session = self._open_session(phase=selected, policy=copy.deepcopy(policy))
+        session = AuthoritySandboxBackend._open_bound_session(self, binding=binding)
         if type(session) is not SandboxSession:
             raise SandboxContractError("sandbox backend did not return a live session")
         try:
-            if not session._is_owned_by(self, selected):
+            if not session._is_pristine_and_bound_to(self, binding):
                 raise SandboxContractError("sandbox backend returned a foreign session")
-            session.require_policy(policy)
         except BaseException:
             try:
                 session.close()
@@ -1016,6 +1089,22 @@ class AuthoritySandboxBackend(ABC):
                 "sandbox backend returned an invalid session"
             ) from None
         return session
+
+    @final
+    def _open_bound_session(
+        self,
+        *,
+        binding: PhasePolicyBinding,
+    ) -> SandboxSession:
+        """Dispatch supported schemas without delegating version selection."""
+        validated_binding = _require_phase_policy_binding(binding)
+        if validated_binding.schema != PHASE_POLICY_SCHEMA:
+            raise SandboxContractError("sandbox backend does not support policy schema")
+        policy = parse_phase_policy(
+            validated_binding.canonical_bytes,
+            expected_phase=validated_binding.phase,
+        )
+        return self._open_session(phase=validated_binding.phase, policy=policy)
 
     @abstractmethod
     def _open_session(self, *, phase: Phase, policy: dict[str, Any]) -> SandboxSession:
@@ -1029,8 +1118,21 @@ class AuthoritySandboxBackend(ABC):
         policy: dict[str, Any],
         cleanup: Callable[[], CleanupStatus],
     ) -> SandboxSession:
-        """Wrap a backend's live OS capability for the Authority driver."""
-        return SandboxSession(_SESSION_CONSTRUCTOR_KEY, self, phase, policy, cleanup)
+        """Wrap a backend-declared lifecycle session with one exact policy."""
+        binding = bind_phase_policy(policy)
+        if binding.phase is not phase:
+            raise SandboxContractError("sandbox session has the wrong phase policy")
+        return self._new_bound_session(binding=binding, cleanup=cleanup)
+
+    @final
+    def _new_bound_session(
+        self,
+        *,
+        binding: PhasePolicyBinding,
+        cleanup: Callable[[], CleanupStatus],
+    ) -> SandboxSession:
+        """Wrap a backend session bound to one exact policy identity."""
+        return SandboxSession(_SESSION_CONSTRUCTOR_KEY, self, binding, cleanup)
 
     @final
     def _new_invocation(
