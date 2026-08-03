@@ -3,15 +3,57 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
+import hashlib
 import inspect
 import io
+import json
 import pickle
 import threading
 import unittest
-from typing import Any
+from pathlib import Path
+from typing import Any, TypeVar
 
+from scripts import release_build_protocol as protocol
 from scripts import release_driver as driver
 from scripts import release_sandbox as sandbox
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "tests" / "fixtures" / "release-build"
+SOURCE_INVENTORY = (
+    "Cargo.toml",
+    "crates/forge-cli/Cargo.toml",
+    "crates/forge-cli/src/main.rs",
+)
+DEPENDENCY_PATHS = (
+    "build-helper-1.2.3/Cargo.toml",
+    "build-helper-1.2.3/src/lib.rs",
+    "serde-1.0.229/Cargo.toml",
+    "serde-1.0.229/src/lib.rs",
+    "test-only-4.5.6/Cargo.toml",
+    "test-only-4.5.6/src/lib.rs",
+)
+
+
+def accepted_plan_fixture() -> protocol.AcceptedReleaseBuildPlan:
+    return protocol.accept_release_build_plan(
+        (FIXTURES / "release-build-plan.json").read_bytes(),
+        json.loads((ROOT / "contracts" / "release-policy.json").read_text()),
+        "a" * 40,
+        (FIXTURES / "Cargo.lock").read_bytes(),
+        protocol.RELEASE_RUST_TOOLCHAIN,
+        "/authority/source",
+        SOURCE_INVENTORY,
+        "/authority/cargo/registry/src",
+        {
+            path: hashlib.sha256(path.encode("utf-8")).hexdigest()
+            for path in DEPENDENCY_PATHS
+        },
+        "/authority/target",
+    )
+
+
+ACCEPTED_PLAN = accepted_plan_fixture()
+_CaptureValue = TypeVar("_CaptureValue")
 
 
 class FakeBackend(sandbox.AuthoritySandboxBackend):
@@ -82,11 +124,17 @@ class FakeOperations:
         self.fail_operation = fail_operation
         self.permits: list[sandbox.SandboxPermit] = []
         self.pinned_xtask = object()
-        self.accepted_plan = object()
+        self.accepted_plan = ACCEPTED_PLAN
         self.execution_capture = object()
         self.apply_capture = object()
         self.plan_xtask: sandbox.SandboxPhaseCapture[object] | None = None
         self.apply_xtask: sandbox.SandboxPhaseCapture[object] | None = None
+        self.execute_plan: (
+            sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan] | None
+        ) = None
+        self.apply_plan: (
+            sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan] | None
+        ) = None
         self.target_check: driver.CanaryTargetCheck | None = None
 
     def _enter(
@@ -103,8 +151,8 @@ class FakeOperations:
         name: str,
         phase: sandbox.Phase,
         permit: sandbox.SandboxPermit,
-        value: object,
-    ) -> sandbox.SandboxProvisionalCapture[object]:
+        value: _CaptureValue,
+    ) -> sandbox.SandboxProvisionalCapture[_CaptureValue]:
         self._enter(name, phase, permit)
         execution = permit.execute(self.backend.invocation(phase))
         return permit.capture(execution, value)
@@ -120,7 +168,7 @@ class FakeOperations:
         self,
         permit: sandbox.SandboxPermit,
         pinned_xtask: sandbox.SandboxPhaseCapture[object],
-    ) -> sandbox.SandboxProvisionalCapture[object]:
+    ) -> sandbox.SandboxProvisionalCapture[protocol.AcceptedReleaseBuildPlan]:
         self.plan_xtask = pinned_xtask
         if pinned_xtask.value is not self.pinned_xtask:
             raise RuntimeError("pinned xtask identity changed")
@@ -129,8 +177,9 @@ class FakeOperations:
     def execute(
         self,
         permit: sandbox.SandboxPermit,
-        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan],
     ) -> sandbox.SandboxProvisionalCapture[object]:
+        self.execute_plan = accepted_plan
         if accepted_plan.value is not self.accepted_plan:
             raise RuntimeError("accepted plan identity changed")
         return self._capture(
@@ -141,10 +190,11 @@ class FakeOperations:
         self,
         permit: sandbox.SandboxPermit,
         pinned_xtask: sandbox.SandboxPhaseCapture[object],
-        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan],
         execution_capture: sandbox.SandboxPhaseCapture[object],
     ) -> sandbox.SandboxProvisionalCapture[object]:
         self.apply_xtask = pinned_xtask
+        self.apply_plan = accepted_plan
         if (
             pinned_xtask.value is not self.pinned_xtask
             or accepted_plan.value is not self.accepted_plan
@@ -192,6 +242,31 @@ class BypassOperations(FakeOperations):
     ) -> sandbox.SandboxProvisionalCapture[object]:
         self._enter("bootstrap", sandbox.Phase.BOOTSTRAP, permit)
         return object()  # type: ignore[return-value]
+
+
+class InvalidPlanOperations(FakeOperations):
+    def __init__(
+        self,
+        events: list[str],
+        backend: FakeBackend,
+        invalid_plan: object,
+    ) -> None:
+        super().__init__(events, backend)
+        self.invalid_plan = invalid_plan
+
+    def plan(
+        self,
+        permit: sandbox.SandboxPermit,
+        pinned_xtask: sandbox.SandboxPhaseCapture[object],
+    ) -> sandbox.SandboxProvisionalCapture[protocol.AcceptedReleaseBuildPlan]:
+        if pinned_xtask.value is not self.pinned_xtask:
+            raise RuntimeError("pinned xtask identity changed")
+        return self._capture(
+            "plan",
+            sandbox.Phase.PLAN,
+            permit,
+            self.invalid_plan,  # type: ignore[arg-type]
+        )
 
 
 class NoopTargetCheckOperations(FakeOperations):
@@ -255,10 +330,16 @@ class ReleaseDriverTests(unittest.TestCase):
             self.assertEqual(policy, sandbox.phase_policy(phase))
         self.assertIsNotNone(operations.plan_xtask)
         self.assertIsNotNone(operations.apply_xtask)
+        self.assertIsNotNone(operations.execute_plan)
+        self.assertIsNotNone(operations.apply_plan)
         assert operations.plan_xtask is not None
         assert operations.apply_xtask is not None
+        assert operations.execute_plan is not None
+        assert operations.apply_plan is not None
         self.assertIs(operations.plan_xtask.value, operations.pinned_xtask)
         self.assertIs(operations.apply_xtask.value, operations.pinned_xtask)
+        self.assertIs(operations.execute_plan, operations.apply_plan)
+        self.assertIs(operations.execute_plan.value, operations.accepted_plan)
         self.assertEqual(
             [permit.phase for permit in operations.permits],
             [
@@ -615,6 +696,47 @@ class ReleaseDriverTests(unittest.TestCase):
                 "close:bootstrap",
             ],
         )
+
+    def test_invalid_plan_is_rejected_after_cleanup_before_execute(self) -> None:
+        class AcceptedPlanSubclass(protocol.AcceptedReleaseBuildPlan):
+            pass
+
+        fields = {
+            name: getattr(ACCEPTED_PLAN, name)
+            for name in ACCEPTED_PLAN.__dataclass_fields__
+        }
+        invalid_plans = (
+            object(),
+            dataclasses.replace(ACCEPTED_PLAN, plan_sha256="f" * 64),
+            AcceptedPlanSubclass(**fields),
+        )
+        for invalid_plan in invalid_plans:
+            with self.subTest(value_type=type(invalid_plan).__name__):
+                events: list[str] = []
+                backend = FakeBackend(events)
+                canary = driver.CanaryDriver(
+                    backend=backend,
+                    operations=InvalidPlanOperations(events, backend, invalid_plan),
+                )
+
+                with self.assertRaises(driver.DriverDiscardedError):
+                    canary.run()
+
+                self.assertEqual(canary.state, driver.DriverState.DISCARDED)
+                self.assertIsNone(canary.report)
+                self.assertEqual(
+                    events,
+                    [
+                        "open:bootstrap",
+                        "operation:bootstrap",
+                        "execute:bootstrap",
+                        "close:bootstrap",
+                        "open:plan",
+                        "operation:plan",
+                        "execute:plan",
+                        "close:plan",
+                    ],
+                )
 
     def test_noop_target_check_cannot_produce_a_canary_report(self) -> None:
         events: list[str] = []
