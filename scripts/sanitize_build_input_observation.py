@@ -908,7 +908,9 @@ def consume_build_input_observation(
         try:
             cleanup_raw_namespace(directory, Path(runner_temp), target)
         except SanitizationError as error:
-            raise _with_diagnostic_code(error, "cleanup") from error
+            raise SanitizationError(
+                str(error), diagnostic_code="cleanup"
+            ) from error
 
 
 def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
