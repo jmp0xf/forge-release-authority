@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import inspect
 import io
 import json
 import os
+import pickle
 import stat
 import struct
+import sys
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator
 from unittest import mock
@@ -1409,6 +1414,101 @@ class VerifyReleaseTests(unittest.TestCase):
             finally:
                 os.close(released_fd)
 
+    def test_exact_input_is_opaque_and_closes_before_releasing_fd(self) -> None:
+        with self.assertRaisesRegex(TypeError, "cannot be constructed directly"):
+            verifier.ExactInput()
+        with self.assertRaisesRegex(TypeError, "cannot be subclassed"):
+            type("ForgedExactInput", (verifier.ExactInput,), {})
+        forged = object.__new__(verifier.ExactInput)
+        with self.assertRaisesRegex(verifier.VerificationError, "ownership"):
+            forged.revalidate()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "input"
+            root.mkdir()
+            (root / "item").write_bytes(b"value")
+            real_close = verifier._close_pinned_directory
+            opened: verifier.ExactInput | None = None
+
+            def require_closed_before_release(
+                pinned: verifier._PinnedDirectory,
+            ) -> None:
+                if opened is not None and pinned is opened._directory:
+                    self.assertTrue(opened._closed)
+                real_close(pinned)
+
+            with mock.patch.object(
+                verifier,
+                "_close_pinned_directory",
+                side_effect=require_closed_before_release,
+            ):
+                with verifier.open_exact_input(
+                    root, {"item": 16}, 16, "opaque input"
+                ) as opened:
+                    forged_with_stolen_lifetime = object.__new__(verifier.ExactInput)
+                    object.__setattr__(
+                        forged_with_stolen_lifetime, "_lifetime", opened._lifetime
+                    )
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError, "ownership"
+                    ):
+                        forged_with_stolen_lifetime.revalidate()
+                    for operation in (
+                        lambda: copy.copy(opened),
+                        lambda: copy.deepcopy(opened),
+                        lambda: pickle.dumps(opened),
+                    ):
+                        with self.assertRaisesRegex(
+                            TypeError, "opaque input cannot be copied or serialized"
+                        ):
+                            operation()
+                    with self.assertRaisesRegex(TypeError, "dataclass"):
+                        replace(opened, _lifetime=object())
+                    copy_replace = getattr(copy, "replace", None)
+                    if copy_replace is not None:
+                        with self.assertRaisesRegex(
+                            TypeError, "opaque input cannot be copied or serialized"
+                        ):
+                            copy_replace(opened, _lifetime=object())
+                    opened.revalidate()
+
+    def test_exact_input_cleanup_rethrows_after_one_close_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "input"
+            root.mkdir()
+            (root / "item").write_bytes(b"value")
+            interruption = KeyboardInterrupt("synthetic input close interruption")
+            attempts = 0
+            opened: verifier.ExactInput | None = None
+            real_close = verifier._close_pinned_directory
+
+            def interrupt_owned_close(pinned: verifier._PinnedDirectory) -> None:
+                nonlocal attempts
+                if opened is not None and pinned is opened._directory:
+                    attempts += 1
+                    raise interruption
+                real_close(pinned)
+
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                with mock.patch.object(
+                    verifier,
+                    "_close_pinned_directory",
+                    side_effect=interrupt_owned_close,
+                ):
+                    with verifier.open_exact_input(
+                        root, {"item": 16}, 16, "interrupted input"
+                    ) as opened:
+                        released_fd = opened._directory.directory_fd
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(attempts, 1)
+            assert opened is not None
+            self.assertTrue(opened._closed)
+            with self.assertRaisesRegex(verifier.VerificationError, "closed"):
+                opened.revalidate()
+            os.fstat(released_fd)
+            os.close(released_fd)
+
     def test_exact_output_rejects_closed_disjoint_input_with_reused_fd(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -1584,6 +1684,492 @@ class VerifyReleaseTests(unittest.TestCase):
             for path in output_directory.iterdir():
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(path.stat().st_nlink, 1)
+
+    def test_exact_output_is_opaque_and_closes_before_releasing_fds(self) -> None:
+        with self.assertRaisesRegex(TypeError, "cannot be constructed directly"):
+            verifier.ExactOutput()
+        with self.assertRaisesRegex(TypeError, "cannot be subclassed"):
+            type("ForgedExactOutput", (verifier.ExactOutput,), {})
+        forged = object.__new__(verifier.ExactOutput)
+        with self.assertRaisesRegex(verifier.VerificationError, "ownership"):
+            forged.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            output = verifier.create_exact_output(
+                output_directory,
+                {"result": b"result"},
+                [],
+                "opaque output",
+                **EXACT_OUTPUT_TEST_BUDGETS,
+            )
+            forged_with_stolen_lifetime = object.__new__(verifier.ExactOutput)
+            object.__setattr__(
+                forged_with_stolen_lifetime, "_lifetime", output._lifetime
+            )
+            with self.assertRaisesRegex(verifier.VerificationError, "ownership"):
+                forged_with_stolen_lifetime.close()
+            for operation in (
+                lambda: copy.copy(output),
+                lambda: copy.deepcopy(output),
+                lambda: pickle.dumps(output),
+            ):
+                with self.assertRaisesRegex(
+                    TypeError, "opaque output cannot be copied or serialized"
+                ):
+                    operation()
+            with self.assertRaisesRegex(TypeError, "dataclass"):
+                replace(output, _lifetime=object())
+            copy_replace = getattr(copy, "replace", None)
+            if copy_replace is not None:
+                with self.assertRaisesRegex(
+                    TypeError, "opaque output cannot be copied or serialized"
+                ):
+                    copy_replace(output, _lifetime=object())
+
+            released_directory_fd = output._directory.directory_fd
+            released_file_fd = output._created_outputs[0].file_fd
+            real_close = verifier._close_fd
+
+            def require_closed_before_release(file_fd: int) -> None:
+                self.assertTrue(output._closed)
+                real_close(file_fd)
+
+            with mock.patch.object(
+                verifier, "_close_fd", side_effect=require_closed_before_release
+            ):
+                output.close()
+
+            reused_directory_fd = os.open(
+                output_directory, os.O_RDONLY | os.O_DIRECTORY
+            )
+            if reused_directory_fd != released_directory_fd:
+                os.dup2(reused_directory_fd, released_directory_fd)
+                os.close(reused_directory_fd)
+            reused_file_fd = os.open(output_directory / "result", os.O_RDONLY)
+            if reused_file_fd != released_file_fd:
+                os.dup2(reused_file_fd, released_file_fd)
+                os.close(reused_file_fd)
+            try:
+                with self.assertRaisesRegex(verifier.VerificationError, "closed"):
+                    output.revalidate()
+                output.close()
+                os.fstat(released_directory_fd)
+                os.fstat(released_file_fd)
+            finally:
+                os.close(released_file_fd)
+                os.close(released_directory_fd)
+
+    def test_exact_output_concurrent_close_has_one_cleanup_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            output = verifier.create_exact_output(
+                output_directory,
+                {"one": b"one", "two": b"two"},
+                [],
+                "concurrent output",
+                **EXACT_OUTPUT_TEST_BUDGETS,
+            )
+            owned_fds = tuple(
+                created.file_fd for created in output._created_outputs
+            ) + (output._directory.directory_fd,)
+            start = threading.Barrier(3)
+            attempted: list[int] = []
+            attempt_lock = threading.Lock()
+            errors: list[BaseException] = []
+            real_close = verifier._close_fd
+            cleanup_started = threading.Event()
+            release_cleanup = threading.Event()
+
+            def track_close(file_fd: int) -> None:
+                with attempt_lock:
+                    attempted.append(file_fd)
+                    first_attempt = len(attempted) == 1
+                if first_attempt:
+                    cleanup_started.set()
+                    if not release_cleanup.wait(timeout=5):
+                        raise AssertionError("concurrent close test timed out")
+                real_close(file_fd)
+
+            def close_from_thread() -> None:
+                try:
+                    start.wait()
+                    output.close()
+                except BaseException as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=close_from_thread) for _ in range(2)]
+            with mock.patch.object(verifier, "_close_fd", side_effect=track_close):
+                for thread in threads:
+                    thread.start()
+                start.wait()
+                self.assertTrue(cleanup_started.wait(timeout=5))
+                try:
+                    for thread in threads:
+                        thread.join(timeout=0.05)
+                    self.assertTrue(all(thread.is_alive() for thread in threads))
+                finally:
+                    release_cleanup.set()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertCountEqual(attempted, owned_fds)
+            self.assertEqual(len(attempted), len(owned_fds))
+
+    def test_exact_output_close_before_cleanup_is_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            output = verifier.create_exact_output(
+                output_directory,
+                {"one": b"one", "two": b"two"},
+                [],
+                "pre-cleanup interruption",
+                **EXACT_OUTPUT_TEST_BUDGETS,
+            )
+            owned_fds = tuple(
+                created.file_fd for created in output._created_outputs
+            ) + (output._directory.directory_fd,)
+            source, start_line = inspect.getsourcelines(
+                verifier._ExactIoLifetime.close_with
+            )
+            cleanup_line = start_line + next(
+                index
+                for index, line in enumerate(source)
+                if line.strip() == "cleanup(attempt)"
+            )
+            interruption = KeyboardInterrupt("synthetic pre-cleanup interruption")
+            armed = True
+
+            def interrupt_before_cleanup(frame: Any, event: str, _argument: Any) -> Any:
+                nonlocal armed
+                if (
+                    armed
+                    and event == "line"
+                    and frame.f_code.co_filename
+                    == str(verifier.AUTHORITY_VERIFIER_PATH)
+                    and frame.f_lineno == cleanup_line
+                ):
+                    armed = False
+                    raise interruption
+                return interrupt_before_cleanup
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_before_cleanup)
+                with (
+                    mock.patch.object(verifier, "_close_fd") as first_attempt,
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    output.close()
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertIs(raised.exception, interruption)
+            first_attempt.assert_not_called()
+            self.assertFalse(output._closed)
+            attempted: list[int] = []
+            real_close = verifier._close_fd
+
+            def track_close(file_fd: int) -> None:
+                attempted.append(file_fd)
+                real_close(file_fd)
+
+            with mock.patch.object(verifier, "_close_fd", side_effect=track_close):
+                output.close()
+            self.assertEqual(attempted, list(owned_fds))
+
+    def test_exact_output_interrupt_after_cleanup_is_not_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            output = verifier.create_exact_output(
+                output_directory,
+                {"one": b"one", "two": b"two"},
+                [],
+                "post-cleanup interruption",
+                **EXACT_OUTPUT_TEST_BUDGETS,
+            )
+            owned_fds = tuple(
+                created.file_fd for created in output._created_outputs
+            ) + (output._directory.directory_fd,)
+            source, start_line = inspect.getsourcelines(
+                verifier._ExactIoLifetime.close_with
+            )
+            final_closed_line = start_line + next(
+                index
+                for index, line in enumerate(source)
+                if line.strip() == "self._state = _EXACT_IO_CLOSED"
+            )
+            interruption = KeyboardInterrupt("synthetic post-cleanup interruption")
+            armed = True
+            attempted: list[int] = []
+            real_close = verifier._close_fd
+
+            def interrupt_before_final_closed(
+                frame: Any, event: str, _argument: Any
+            ) -> Any:
+                nonlocal armed
+                if (
+                    armed
+                    and event == "line"
+                    and frame.f_code.co_filename
+                    == str(verifier.AUTHORITY_VERIFIER_PATH)
+                    and frame.f_lineno == final_closed_line
+                ):
+                    armed = False
+                    raise interruption
+                return interrupt_before_final_closed
+
+            def track_close(file_fd: int) -> None:
+                attempted.append(file_fd)
+                real_close(file_fd)
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_before_final_closed)
+                with (
+                    mock.patch.object(verifier, "_close_fd", side_effect=track_close),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    output.close()
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(attempted, list(owned_fds))
+            self.assertTrue(output._closed)
+            for file_fd in owned_fds:
+                with self.assertRaises(OSError):
+                    os.fstat(file_fd)
+            with mock.patch.object(verifier, "_close_fd") as retried:
+                output.close()
+            retried.assert_not_called()
+
+    def test_exact_output_reentrant_close_is_rejected_while_live(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            output = verifier.create_exact_output(
+                output_directory,
+                {"result": b"result"},
+                [],
+                "reentrant output",
+                **EXACT_OUTPUT_TEST_BUDGETS,
+            )
+            owned_fds = {
+                *(created.file_fd for created in output._created_outputs),
+                output._directory.directory_fd,
+            }
+            close_errors: list[verifier.VerificationError] = []
+            owned_close_attempts: list[int] = []
+            attempted = False
+            real_components = verifier._path_component_identities
+            real_close = verifier._close_fd
+
+            def attempt_reentrant_close(*args: Any, **kwargs: Any) -> Any:
+                nonlocal attempted
+                if not attempted:
+                    attempted = True
+                    try:
+                        output.close()
+                    except verifier.VerificationError as error:
+                        close_errors.append(error)
+                return real_components(*args, **kwargs)
+
+            def track_owned_close(file_fd: int) -> None:
+                if file_fd in owned_fds:
+                    owned_close_attempts.append(file_fd)
+                real_close(file_fd)
+
+            with (
+                mock.patch.object(
+                    verifier,
+                    "_path_component_identities",
+                    side_effect=attempt_reentrant_close,
+                ),
+                mock.patch.object(verifier, "_close_fd", side_effect=track_owned_close),
+            ):
+                output.revalidate()
+
+            self.assertEqual(len(close_errors), 1)
+            self.assertRegex(str(close_errors[0]), "active operation")
+            self.assertEqual(owned_close_attempts, [])
+            self.assertFalse(output._closed)
+            output.close()
+
+    def test_exact_output_close_attempts_all_fds_then_rethrows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            output = verifier.create_exact_output(
+                output_directory,
+                {"one": b"one", "two": b"two"},
+                [],
+                "interrupted output",
+                **EXACT_OUTPUT_TEST_BUDGETS,
+            )
+            owned_fds = tuple(
+                created.file_fd for created in output._created_outputs
+            ) + (output._directory.directory_fd,)
+            interruption = KeyboardInterrupt("synthetic output close interruption")
+            attempted: list[int] = []
+            real_close = verifier._close_fd
+
+            def interrupt_first_close(file_fd: int) -> None:
+                attempted.append(file_fd)
+                if len(attempted) == 1:
+                    raise interruption
+                real_close(file_fd)
+
+            with (
+                mock.patch.object(
+                    verifier, "_close_fd", side_effect=interrupt_first_close
+                ),
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                output.close()
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(attempted, list(owned_fds))
+            with mock.patch.object(verifier, "_close_fd") as retried:
+                output.close()
+            retried.assert_not_called()
+            os.fstat(owned_fds[0])
+            for file_fd in owned_fds[1:]:
+                with self.assertRaises(OSError):
+                    os.fstat(file_fd)
+            os.close(owned_fds[0])
+
+    def test_failed_exact_output_alias_rejects_reused_fds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            captured: list[verifier.ExactOutput] = []
+
+            def capture_then_reject(output: verifier.ExactOutput) -> None:
+                captured.append(output)
+                raise verifier.VerificationError("synthetic final rejection")
+
+            with (
+                mock.patch.object(
+                    verifier.ExactOutput,
+                    "revalidate",
+                    autospec=True,
+                    side_effect=capture_then_reject,
+                ),
+                self.assertRaisesRegex(
+                    verifier.VerificationError, "synthetic final rejection"
+                ),
+            ):
+                verifier.create_exact_output(
+                    output_directory,
+                    {"result": b"result"},
+                    [],
+                    "rejected output",
+                    **EXACT_OUTPUT_TEST_BUDGETS,
+                )
+
+            self.assertEqual(len(captured), 1)
+            stale = captured[0]
+            released_directory_fd = stale._directory.directory_fd
+            released_file_fd = stale._created_outputs[0].file_fd
+            reused_directory_fd = os.open(
+                output_directory, os.O_RDONLY | os.O_DIRECTORY
+            )
+            if reused_directory_fd != released_directory_fd:
+                os.dup2(reused_directory_fd, released_directory_fd)
+                os.close(reused_directory_fd)
+            reused_file_fd = os.open(output_directory / "result", os.O_RDONLY)
+            if reused_file_fd != released_file_fd:
+                os.dup2(reused_file_fd, released_file_fd)
+                os.close(reused_file_fd)
+            try:
+                with self.assertRaisesRegex(verifier.VerificationError, "closed"):
+                    stale.revalidate()
+                stale.close()
+                os.fstat(released_directory_fd)
+                os.fstat(released_file_fd)
+            finally:
+                os.close(released_file_fd)
+                os.close(released_directory_fd)
+
+    def test_failed_exact_output_cleanup_attempts_all_fds_then_rethrows(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "output"
+            output_directory.mkdir(mode=0o700)
+            output_directory.chmod(0o700)
+            captured: list[verifier.ExactOutput] = []
+            attempted: list[int] = []
+            armed = False
+            interruption = KeyboardInterrupt("synthetic failed-create interruption")
+            real_close = verifier._close_fd
+
+            def capture_then_reject(output: verifier.ExactOutput) -> None:
+                nonlocal armed
+                captured.append(output)
+                armed = True
+                raise verifier.VerificationError("synthetic final rejection")
+
+            def interrupt_first_cleanup(file_fd: int) -> None:
+                if not armed:
+                    real_close(file_fd)
+                    return
+                attempted.append(file_fd)
+                if len(attempted) == 1:
+                    raise interruption
+                real_close(file_fd)
+
+            with (
+                mock.patch.object(
+                    verifier.ExactOutput,
+                    "revalidate",
+                    autospec=True,
+                    side_effect=capture_then_reject,
+                ),
+                mock.patch.object(
+                    verifier, "_close_fd", side_effect=interrupt_first_cleanup
+                ),
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                verifier.create_exact_output(
+                    output_directory,
+                    {"one": b"one", "two": b"two"},
+                    [],
+                    "failed output",
+                    **EXACT_OUTPUT_TEST_BUDGETS,
+                )
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(len(captured), 1)
+            stale = captured[0]
+            owned_fds = tuple(created.file_fd for created in stale._created_outputs) + (
+                stale._directory.directory_fd,
+            )
+            self.assertEqual(attempted, list(owned_fds))
+            with self.assertRaisesRegex(verifier.VerificationError, "closed"):
+                stale.revalidate()
+            with mock.patch.object(verifier, "_close_fd") as retried:
+                stale.close()
+            retried.assert_not_called()
+            os.fstat(owned_fds[0])
+            for file_fd in owned_fds[1:]:
+                with self.assertRaises(OSError):
+                    os.fstat(file_fd)
+            os.close(owned_fds[0])
 
     def test_exact_output_rejects_unsafe_or_nonfresh_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
