@@ -11,9 +11,18 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Literal, Protocol, Sequence, TypeVar, cast
+from typing import (
+    Any,
+    Literal,
+    NoReturn,
+    Protocol,
+    SupportsIndex,
+    TypeVar,
+    cast,
+)
 
 if __package__:
     from . import release_sandbox as sandbox
@@ -91,11 +100,61 @@ class CanaryOperations(Protocol):
 
     def verify_target(
         self, apply_capture: sandbox.SandboxPhaseCapture[object]
-    ) -> None: ...
+    ) -> CanaryTargetCheck: ...
 
 
 _Result = TypeVar("_Result")
 _MISSING = object()
+_TARGET_CHECK_CONSTRUCTOR_KEY = object()
+
+
+class CanaryTargetCheck:
+    """Nominal canary result bound to one sealed APPLY capture.
+
+    This records an Authority callback's affirmative result.  It is neither
+    semantic validation nor release evidence; the driver also requires exact
+    identity with the APPLY capture it supplied.
+    """
+
+    __slots__ = ("__apply_capture",)
+
+    def __init__(
+        self,
+        constructor_key: object,
+        apply_capture: sandbox.SandboxPhaseCapture[object],
+    ) -> None:
+        if constructor_key is not _TARGET_CHECK_CONSTRUCTOR_KEY:
+            raise TypeError("canary target checks are driver-created only")
+        self.__apply_capture = apply_capture
+
+    def __copy__(self) -> NoReturn:
+        raise TypeError("canary target checks cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> NoReturn:
+        del memo
+        raise TypeError("canary target checks cannot be copied")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("canary target checks cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("canary target checks cannot be serialized")
+
+    def _binds(self, apply_capture: sandbox.SandboxPhaseCapture[object]) -> bool:
+        return self.__apply_capture is apply_capture
+
+
+def canary_target_checked(
+    apply_capture: sandbox.SandboxPhaseCapture[object],
+) -> CanaryTargetCheck:
+    """Create the nominal result expected from a successful canary-only check."""
+    if (
+        type(apply_capture) is not sandbox.SandboxPhaseCapture
+        or apply_capture.phase is not sandbox.Phase.APPLY
+    ):
+        raise DriverError("canary target check requires the sealed APPLY capture")
+    return CanaryTargetCheck(_TARGET_CHECK_CONSTRUCTOR_KEY, apply_capture)
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +288,11 @@ class CanaryDriver:
             )
             self._transition(DriverState.EXECUTION_CAPTURED, DriverState.APPLY_CAPTURED)
 
-            self._operations.verify_target(apply_capture)
+            target_check = self._operations.verify_target(apply_capture)
+            if type(target_check) is not CanaryTargetCheck or not target_check._binds(
+                apply_capture
+            ):
+                raise DriverDiscardedError("canary target check is invalid")
             self._transition(
                 DriverState.APPLY_CAPTURED, DriverState.CANARY_TARGET_CHECKED
             )
@@ -289,7 +352,9 @@ class _UnavailableOperations:
         del permit, pinned_xtask, accepted_plan, execution_capture
         raise DriverDiscardedError("canary operations unavailable")
 
-    def verify_target(self, apply_capture: sandbox.SandboxPhaseCapture[object]) -> None:
+    def verify_target(
+        self, apply_capture: sandbox.SandboxPhaseCapture[object]
+    ) -> CanaryTargetCheck:
         del apply_capture
         raise DriverDiscardedError("canary operations unavailable")
 
