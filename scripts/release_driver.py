@@ -65,23 +65,33 @@ _NEXT_STATE = {
 class CanaryOperations(Protocol):
     """Authority-owned operations invoked by the platform-neutral kernel."""
 
-    def bootstrap(self, permit: sandbox.SandboxPermit) -> object: ...
+    def bootstrap(
+        self, permit: sandbox.SandboxPermit
+    ) -> sandbox.SandboxProvisionalCapture[object]: ...
 
-    def plan(self, permit: sandbox.SandboxPermit, pinned_xtask: object) -> object: ...
+    def plan(
+        self,
+        permit: sandbox.SandboxPermit,
+        pinned_xtask: sandbox.SandboxPhaseCapture[object],
+    ) -> sandbox.SandboxProvisionalCapture[object]: ...
 
     def execute(
-        self, permit: sandbox.SandboxPermit, accepted_plan: object
-    ) -> object: ...
+        self,
+        permit: sandbox.SandboxPermit,
+        accepted_plan: sandbox.SandboxPhaseCapture[object],
+    ) -> sandbox.SandboxProvisionalCapture[object]: ...
 
     def apply(
         self,
         permit: sandbox.SandboxPermit,
-        pinned_xtask: object,
-        accepted_plan: object,
-        execution_capture: object,
-    ) -> object: ...
+        pinned_xtask: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        execution_capture: sandbox.SandboxPhaseCapture[object],
+    ) -> sandbox.SandboxProvisionalCapture[object]: ...
 
-    def verify_target(self, apply_capture: object) -> None: ...
+    def verify_target(
+        self, apply_capture: sandbox.SandboxPhaseCapture[object]
+    ) -> None: ...
 
 
 _Result = TypeVar("_Result")
@@ -140,8 +150,10 @@ class CanaryDriver:
     def _run_phase(
         self,
         phase: sandbox.Phase,
-        operation: Callable[[sandbox.SandboxPermit], _Result],
-    ) -> _Result:
+        operation: Callable[
+            [sandbox.SandboxPermit], sandbox.SandboxProvisionalCapture[_Result]
+        ],
+    ) -> sandbox.SandboxPhaseCapture[_Result]:
         policy = sandbox.phase_policy(phase)
         session: sandbox.SandboxSession | None = None
         result: object = _MISSING
@@ -154,24 +166,31 @@ class CanaryDriver:
             )
             permit = session.issue_permit()
             result = operation(permit)
-            session.require_permit(permit, expected_phase=phase)
         except BaseException:
             operation_failed = True
 
         cleanup_status = sandbox.CleanupStatus.UNKNOWN
+        sealed: sandbox.SandboxPhaseCapture[object] | None = None
         if session is not None:
             try:
-                cleanup_status = session.close()
+                if operation_failed or result is _MISSING:
+                    cleanup_status = session.close()
+                else:
+                    sealed = session.close_and_seal(
+                        cast(sandbox.SandboxProvisionalCapture[object], result),
+                        expected_phase=phase,
+                    )
+                    cleanup_status = sandbox.CleanupStatus.CONFIRMED
             except BaseException:
                 cleanup_status = sandbox.CleanupStatus.UNKNOWN
 
         if (
             operation_failed
             or cleanup_status is not sandbox.CleanupStatus.CONFIRMED
-            or result is _MISSING
+            or sealed is None
         ):
             raise DriverDiscardedError("canary phase failed")
-        return cast(_Result, result)
+        return cast(sandbox.SandboxPhaseCapture[_Result], sealed)
 
     def run(self) -> CanaryReport:
         """Run exactly one diagnostic canary; no qualification mode exists."""
@@ -238,29 +257,39 @@ def run_canary(
 
 
 class _UnavailableOperations:
-    def bootstrap(self, permit: sandbox.SandboxPermit) -> object:
+    def bootstrap(
+        self, permit: sandbox.SandboxPermit
+    ) -> sandbox.SandboxProvisionalCapture[object]:
         del permit
         raise DriverDiscardedError("canary operations unavailable")
 
-    def plan(self, permit: sandbox.SandboxPermit, pinned_xtask: object) -> object:
+    def plan(
+        self,
+        permit: sandbox.SandboxPermit,
+        pinned_xtask: sandbox.SandboxPhaseCapture[object],
+    ) -> sandbox.SandboxProvisionalCapture[object]:
         del permit, pinned_xtask
         raise DriverDiscardedError("canary operations unavailable")
 
-    def execute(self, permit: sandbox.SandboxPermit, accepted_plan: object) -> object:
+    def execute(
+        self,
+        permit: sandbox.SandboxPermit,
+        accepted_plan: sandbox.SandboxPhaseCapture[object],
+    ) -> sandbox.SandboxProvisionalCapture[object]:
         del permit, accepted_plan
         raise DriverDiscardedError("canary operations unavailable")
 
     def apply(
         self,
         permit: sandbox.SandboxPermit,
-        pinned_xtask: object,
-        accepted_plan: object,
-        execution_capture: object,
-    ) -> object:
+        pinned_xtask: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        execution_capture: sandbox.SandboxPhaseCapture[object],
+    ) -> sandbox.SandboxProvisionalCapture[object]:
         del permit, pinned_xtask, accepted_plan, execution_capture
         raise DriverDiscardedError("canary operations unavailable")
 
-    def verify_target(self, apply_capture: object) -> None:
+    def verify_target(self, apply_capture: sandbox.SandboxPhaseCapture[object]) -> None:
         del apply_capture
         raise DriverDiscardedError("canary operations unavailable")
 
