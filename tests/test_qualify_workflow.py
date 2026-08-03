@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 QUALIFY_WORKFLOW = ROOT / ".github" / "workflows" / "qualify.yml"
 VERIFY_WORKFLOW = ROOT / ".github" / "workflows" / "verify.yml"
+WRITER_PATH = ROOT / "scripts" / "write_canary_observation.py"
 WORKFLOW_DIRECTORY = ROOT / ".github" / "workflows"
 POLICY_PATH = ROOT / "contracts" / "release-policy.json"
 ALLOWED_ACTIONS = {
@@ -94,6 +95,18 @@ class QualifyWorkflowTests(unittest.TestCase):
             "test_cross_view_snapshot_rejects_unknown_or_different_objects",
             windows,
         )
+        self.assertIn(
+            "test_windows_consume_removes_raw_and_preserves_only_summary", windows
+        )
+        self.assertNotIn("test_consume_removes_raw_on_success_and_malformed_input", windows)
+        self.assertIn(
+            "test_cleanup_removes_fixed_raw_before_reporting_entry_overflow",
+            windows,
+        )
+        self.assertIn(
+            "test_windows_paths_require_drive_absolute_and_do_not_trust_substrings",
+            windows,
+        )
 
     def test_only_protected_job_has_signing_permissions(self) -> None:
         workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
@@ -105,10 +118,9 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertNotIn("${{ secrets", workflow)
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("overwrite: true", workflow)
-        self.assertEqual(workflow.count("overwrite: false"), 7)
+        self.assertEqual(workflow.count("overwrite: false"), 6)
         expected_retention = {
             "Upload canary runner observation": 30,
-            "Upload fixed native handoff": 30,
             "Upload exact finalized assets": 30,
             "Upload exact builder records": 30,
             "Upload deterministic qualification preview": 30,
@@ -152,6 +164,144 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertNotIn("cargo ", protected.lower())
         self.assertNotIn("xtask", protected.lower())
 
+    def test_stage_a_dispatch_is_canary_only_and_fails_closed(self) -> None:
+        workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
+        header = workflow[: workflow.index("jobs:\n")]
+        input_names = re.findall(
+            r"^      ([A-Za-z][A-Za-z0-9]*):\s*$", header, re.MULTILINE
+        )
+        self.assertEqual(input_names, ["sourceCommit", "mode"])
+        self.assertIn(
+            "      mode:\n"
+            "        description: Inactive release-authority diagnostic mode\n"
+            "        required: true\n"
+            "        type: choice\n"
+            "        options:\n"
+            "          - canary\n",
+            header,
+        )
+        self.assertNotIn("default:", header)
+        self.assertNotIn("qualification", header.lower())
+        self.assertIn("run-name: Canary Forge", header)
+        self.assertIn("group: forge-v0.1.0-rc.2-canary", header)
+
+        jobs = _job_blocks(workflow)
+        preflight = jobs["preflight"]
+        native = jobs["native-build"]
+        self.assertEqual(preflight.count("DISPATCH_MODE: ${{ inputs.mode }}"), 1)
+        self.assertEqual(
+            preflight.count('if os.environ["DISPATCH_MODE"] != "canary":'), 1
+        )
+        self.assertEqual(
+            len(
+                re.findall(
+                    r"^    if: \$\{\{ inputs\.mode == 'canary' \}\}$",
+                    native,
+                    re.MULTILINE,
+                )
+            ),
+            1,
+        )
+
+    def test_private_build_input_is_consumed_at_first_authority_boundary(self) -> None:
+        workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
+        native = _job_blocks(workflow)["native-build"]
+        unix_create = _step_block(native, "Create fresh native directories")
+        windows_create = _step_block(
+            native, "Create fresh native directories on Windows"
+        )
+        unix_build = _step_block(native, "Check, test, and observe native candidate")
+        windows_build = _step_block(
+            native, "Check, test, and observe native candidate on Windows"
+        )
+
+        self.assertNotIn("${{ runner.temp }}", native)
+        for block in (unix_create, unix_build):
+            self.assertEqual(
+                block.count(
+                    'BUILD_INPUT_DIR="$RUNNER_TEMP/forge-private-build-input"'
+                ),
+                1,
+            )
+            self.assertEqual(
+                block.count('BUILD_TEMP="$RUNNER_TEMP/forge-private-build-temp"'),
+                1,
+            )
+        for block in (windows_create, windows_build):
+            self.assertEqual(block.count("forge-private-build-input"), 1)
+            self.assertEqual(block.count("forge-private-build-temp"), 1)
+            self.assertIn("$env:RUNNER_TEMP", block)
+        for block in (unix_create, windows_create):
+            self.assertIn("refusing existing native directory", block)
+
+        for platform, block, writer in (
+            ("unix", unix_build, "scripts/write_canary_observation.py"),
+            ("windows", windows_build, r"scripts\write_canary_observation.py"),
+        ):
+            self.assertEqual(block.count("--build-input-observation-dir"), 2, platform)
+            self.assertEqual(block.count("--build-temp"), 1, platform)
+            self.assertEqual(block.count("--expected-cargo"), 1, platform)
+            self.assertEqual(block.count("--runner-temp"), 2, platform)
+            release_index = block.index("release-build")
+            writer_index = block.index(writer)
+            version_index = block.index("version", writer_index)
+            self.assertLess(release_index, writer_index, platform)
+            self.assertLess(writer_index, version_index, platform)
+            between = block[release_index:writer_index]
+            self.assertNotIn("write_builder_record", between, platform)
+            self.assertNotIn("Copy-Item", between, platform)
+            self.assertNotIn("chmod", between, platform)
+
+        self.assertLess(
+            unix_build.index("trap cleanup_private_build_input EXIT"),
+            unix_build.index("release-build"),
+        )
+        self.assertIn("--cleanup-only", unix_build)
+        self.assertLess(windows_build.index("try {"), windows_build.index("release-build"))
+        self.assertGreater(windows_build.index("finally {"), windows_build.index("release-build"))
+        self.assertIn("--cleanup-only", windows_build)
+
+        writer_source = WRITER_PATH.read_text(encoding="utf-8")
+        writer_main = writer_source[writer_source.index("def main(") :]
+        consume_index = writer_main.index("consume_build_input_observation(")
+        build_index = writer_main.index("observation = build_observation(")
+        write_index = writer_main.index("output = write_observation(")
+        self.assertLess(consume_index, build_index)
+        self.assertLess(build_index, write_index)
+
+        upload_names = (
+            "Upload canary runner observation",
+            "Upload exact finalized assets",
+            "Upload exact builder records",
+            "Upload deterministic qualification preview",
+            "Upload qualified release assets",
+            "Upload qualification evidence",
+        )
+        for name in upload_names:
+            upload = _step_block(workflow, name)
+            self.assertNotIn("BUILD_INPUT_DIR", upload, name)
+            self.assertNotIn("forge-private-build-input", upload, name)
+            self.assertNotIn("release-build-input-observation-", upload, name)
+
+    def test_stage_a_qualification_path_is_statically_unreachable(self) -> None:
+        workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
+        jobs = _job_blocks(workflow)
+        for name in ("finalize", "independent-qualify", "protected-attest"):
+            self.assertEqual(jobs[name].count("    if: ${{ false }}\n"), 1, name)
+
+        native = jobs["native-build"]
+        canary_upload = _step_block(workflow, "Upload canary runner observation")
+        self.assertEqual(
+            canary_upload.count("        if: ${{ inputs.mode == 'canary' }}\n"), 1
+        )
+        self.assertNotIn("Upload fixed native handoff", workflow)
+        self.assertNotIn("write_builder_record.py", native)
+        self.assertNotIn("HANDOFF_DIR", native)
+        self.assertNotIn("always()", workflow)
+        self.assertNotIn("continue-on-error", workflow)
+        self.assertEqual(workflow.count("uses: actions/attest@"), 1)
+        self.assertIn("uses: actions/attest@", jobs["protected-attest"])
+
     def test_native_matrix_and_embedded_python_match_reviewed_contracts(self) -> None:
         workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
         policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
@@ -164,7 +314,6 @@ class QualifyWorkflowTests(unittest.TestCase):
                   target: {target["triple"]}
                   binary: {target["binary"]}
                   sbom: {target["sbom"]}
-                  record: {target["builderRecord"]}
                 """
             )
             self.assertIn(textwrap.indent(fragment, "          ").rstrip(), native)
@@ -186,21 +335,21 @@ class QualifyWorkflowTests(unittest.TestCase):
         windows_install = _step_block(
             native, "Install exact Rust toolchain on Windows"
         )
-        unix_build = _step_block(native, "Check, test, and stage native assets")
+        unix_build = _step_block(native, "Check, test, and observe native candidate")
         windows_build = _step_block(
-            native, "Check, test, and stage native assets on Windows"
+            native, "Check, test, and observe native candidate on Windows"
         )
 
         rust_version = policy["toolchain"]["rust"]
         self.assertEqual(workflow.count(f"  RUSTUP_TOOLCHAIN: {rust_version}\n"), 1)
         self.assertLess(
             native.index("      - name: Install exact Rust toolchain\n"),
-            native.index("      - name: Check, test, and stage native assets\n"),
+            native.index("      - name: Check, test, and observe native candidate\n"),
         )
         self.assertLess(
             native.index("      - name: Install exact Rust toolchain on Windows\n"),
             native.index(
-                "      - name: Check, test, and stage native assets on Windows\n"
+                "      - name: Check, test, and observe native candidate on Windows\n"
             ),
         )
 
@@ -236,9 +385,9 @@ class QualifyWorkflowTests(unittest.TestCase):
         workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
         jobs = _job_blocks(workflow)
         native = jobs["native-build"]
-        unix_build = _step_block(workflow, "Check, test, and stage native assets")
+        unix_build = _step_block(workflow, "Check, test, and observe native candidate")
         windows_build = _step_block(
-            workflow, "Check, test, and stage native assets on Windows"
+            workflow, "Check, test, and observe native candidate on Windows"
         )
         upload = _step_block(workflow, "Upload canary runner observation")
 
@@ -248,14 +397,30 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.count(windows_script), 1)
         self.assertIn(script, unix_build)
         self.assertIn(windows_script, windows_build)
-        unix_observation = unix_build[unix_build.index(script) :]
-        windows_observation = windows_build[windows_build.index(windows_script) :]
+        unix_observation_start = unix_build.index(script)
+        unix_observation = unix_build[
+            unix_observation_start : unix_build.index(
+                "          trap - EXIT", unix_observation_start
+            )
+        ]
+        windows_observation_start = windows_build.index(windows_script)
+        windows_observation = windows_build[
+            windows_observation_start : windows_build.index(
+                "$observationStatus = $LASTEXITCODE",
+                windows_observation_start,
+            )
+        ]
         for argument in (
             "--authority-commit",
             "--binary",
+            "--build-input-observation-dir",
+            "--build-temp",
             "--cargo-home",
+            "--expected-cargo",
             "--output-dir",
+            "--runner-temp",
             "--source-commit",
+            "--source-root",
             "--target",
         ):
             self.assertEqual(unix_observation.count(argument), 1, argument)
@@ -281,6 +446,9 @@ class QualifyWorkflowTests(unittest.TestCase):
             self.assertNotIn(windows_script, jobs[job_name], job_name)
         self.assertEqual(workflow.count("name: canary-observation-"), 1)
         self.assertEqual(workflow.count("runner-observation-${{ matrix.target }}.json"), 1)
+        self.assertNotIn("Upload fixed native handoff", workflow)
+        self.assertNotIn("write_builder_record.py", native)
+        self.assertNotIn("HANDOFF_DIR", native)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -19,6 +20,26 @@ from scripts import write_canary_observation as observations
 SOURCE_COMMIT = "1" * 40
 AUTHORITY_COMMIT = "2" * 40
 TARGET = "x86_64-apple-darwin"
+
+
+def _candidate_build_input_summary() -> dict[str, object]:
+    sanitizer = observations.build_input_sanitizer
+    return {
+        "evidence_status": sanitizer.SUMMARY_EVIDENCE_STATUS,
+        "reported_cargo_command": {
+            "argument_count": 13,
+            "native_encoding": "unix-bytes",
+            "profile": "forge-release-cargo-v1",
+            "program_profile": "matches-authority-selected-cargo",
+            "target_directory_profile": "absolute-under-authority-build-temp-disjoint",
+            "working_directory_profile": "absolute-under-authority-build-temp-isolated-source",
+        },
+        "reported_phase": sanitizer.SOURCE_PHASE,
+        "reported_windows_msvc_environment": {"status": "reported-not-applicable"},
+        "schema": sanitizer.SUMMARY_SCHEMA,
+        "source_contract": sanitizer.SOURCE_SCHEMA,
+        "trust": sanitizer.SUMMARY_TRUST,
+    }
 
 
 def _stat_view(
@@ -90,6 +111,7 @@ class CanaryObservationTests(unittest.TestCase):
                     authority_commit=AUTHORITY_COMMIT,
                     binary=binary,
                     cargo_home=cargo_home,
+                    candidate_build_input_summary=_candidate_build_input_summary(),
                     environment=environment,
                     system="Darwin",
                 )
@@ -97,6 +119,10 @@ class CanaryObservationTests(unittest.TestCase):
             self.assertEqual(record["schema"], observations.SCHEMA)
             self.assertEqual(record["purpose"], observations.PURPOSE)
             self.assertEqual(record["target"], TARGET)
+            self.assertEqual(
+                record["candidate_build_input_summary"],
+                _candidate_build_input_summary(),
+            )
             self.assertEqual(
                 record["binary"]["sha256"], hashlib.sha256(b"native-binary").hexdigest()
             )
@@ -383,11 +409,12 @@ class CanaryObservationTests(unittest.TestCase):
                     authority_commit=AUTHORITY_COMMIT,
                     binary=Path("forge"),
                     cargo_home=Path("cargo-home"),
+                    candidate_build_input_summary=_candidate_build_input_summary(),
                     environment={},
                     system="Darwin",
                 )
 
-    def test_windows_probe_declares_internal_msvc_environment_unavailable(self) -> None:
+    def test_windows_probe_separates_outer_probe_from_candidate_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             binary = Path(temporary) / "forge.exe"
             binary.write_bytes(b"MZ")
@@ -408,7 +435,8 @@ class CanaryObservationTests(unittest.TestCase):
             {"platform": platform_record, "runtime": runtime, "limitations": limitations},
             sort_keys=True,
         )
-        self.assertIn("internal environment is unavailable", rendered)
+        self.assertIn("separate candidate build-input summary", rendered)
+        self.assertIn("neither view is claimed as independent release evidence", rendered)
         self.assertNotIn("must-not-be-recorded", rendered)
         self.assertNotIn('"INCLUDE"', rendered)
         self.assertNotIn('"LIB"', rendered)
@@ -419,6 +447,112 @@ class CanaryObservationTests(unittest.TestCase):
             observations._safe_target("invented-target")
         with self.assertRaisesRegex(observations.ObservationError, "must be absolute"):
             observations.write_observation(Path("relative"), TARGET, {})
+
+    def test_main_consumes_private_input_before_building_and_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            binary = root / "stage" / "forge"
+            output = root / "observation" / f"runner-observation-{TARGET}.json"
+            arguments = [
+                "--authority-commit",
+                AUTHORITY_COMMIT,
+                "--binary",
+                os.fspath(binary),
+                "--build-input-observation-dir",
+                os.fspath(root / "runner" / "forge-private-build-input"),
+                "--build-temp",
+                os.fspath(root / "runner" / "forge-private-build-temp"),
+                "--cargo-home",
+                os.fspath(root / "cargo-home"),
+                "--expected-cargo",
+                os.fspath(root / "tool" / "cargo"),
+                "--output-dir",
+                os.fspath(root / "observation"),
+                "--runner-temp",
+                os.fspath(root / "runner"),
+                "--source-commit",
+                SOURCE_COMMIT,
+                "--source-root",
+                os.fspath(root / "source"),
+                "--target",
+                TARGET,
+            ]
+            order: list[str] = []
+            summary = _candidate_build_input_summary()
+
+            def consume(**_kwargs: object) -> dict[str, object]:
+                order.append("consume")
+                return summary
+
+            def build(**kwargs: object) -> dict[str, object]:
+                order.append("build")
+                self.assertIs(kwargs["candidate_build_input_summary"], summary)
+                return {"schema": observations.SCHEMA}
+
+            def write(*_args: object) -> Path:
+                order.append("write")
+                return output
+
+            with (
+                mock.patch.object(
+                    observations.build_input_sanitizer,
+                    "consume_build_input_observation",
+                    side_effect=consume,
+                ),
+                mock.patch.object(observations, "build_observation", side_effect=build),
+                mock.patch.object(observations, "write_observation", side_effect=write),
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                self.assertEqual(observations.main(arguments), 0)
+
+            self.assertEqual(order, ["consume", "build", "write"])
+
+    def test_main_stops_after_content_free_sanitization_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            private_value = os.fspath(root / "private-user-path")
+            arguments = [
+                "--authority-commit",
+                AUTHORITY_COMMIT,
+                "--binary",
+                os.fspath(root / "stage" / "forge"),
+                "--build-input-observation-dir",
+                os.fspath(root / "runner" / "forge-private-build-input"),
+                "--build-temp",
+                os.fspath(root / "runner" / "forge-private-build-temp"),
+                "--cargo-home",
+                os.fspath(root / "cargo-home"),
+                "--expected-cargo",
+                os.fspath(root / "tool" / "cargo"),
+                "--output-dir",
+                os.fspath(root / "observation"),
+                "--runner-temp",
+                os.fspath(root / "runner"),
+                "--source-commit",
+                SOURCE_COMMIT,
+                "--source-root",
+                os.fspath(root / "source"),
+                "--target",
+                TARGET,
+            ]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    observations.build_input_sanitizer,
+                    "consume_build_input_observation",
+                    side_effect=observations.build_input_sanitizer.SanitizationError(
+                        private_value
+                    ),
+                ),
+                mock.patch.object(observations, "build_observation") as build,
+                mock.patch.object(observations, "write_observation") as write,
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(observations.main(arguments), 1)
+
+            build.assert_not_called()
+            write.assert_not_called()
+            self.assertNotIn(private_value, stderr.getvalue())
 
 
 if __name__ == "__main__":

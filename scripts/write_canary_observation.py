@@ -24,8 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Sequence
 
+if __package__:
+    from . import sanitize_build_input_observation as build_input_sanitizer
+else:
+    import sanitize_build_input_observation as build_input_sanitizer
 
-SCHEMA = "forge.release-authority-canary-observation/v1"
+
+SCHEMA = "forge.release-authority-canary-observation/v2"
 PURPOSE = "inactive-canary-diagnostic-only"
 TARGETS = {
     "aarch64-apple-darwin",
@@ -879,9 +884,9 @@ def _platform_observation(
         runtime = {"dumpbin_dependents": dumpbin}
         limitations.append(
             "Windows compiler/linker discovery here observes only the outer workflow shell. "
-            "Forge xtask resolves and projects its own bounded MSVC PATH/LIB/INCLUDE environment; "
-            "that internal environment is unavailable to this authority-side canary script and is "
-            "not claimed or reconstructed."
+            "The separate candidate build-input summary reports only a sanitized classification "
+            "of Forge xtask's internal bounded MSVC PATH/LIB/INCLUDE projection; neither view is "
+            "claimed as independent release evidence."
         )
         return {"commands": windows_commands, "executables": tools}, runtime, limitations
 
@@ -896,6 +901,7 @@ def build_observation(
     authority_commit: str,
     binary: Path,
     cargo_home: Path,
+    candidate_build_input_summary: Mapping[str, Any],
     environment: Mapping[str, str],
     system: str | None = None,
     budget: HashBudget | None = None,
@@ -903,6 +909,27 @@ def build_observation(
     target = _safe_target(target)
     source_commit = _safe_git_sha(source_commit, "source commit")
     authority_commit = _safe_git_sha(authority_commit, "authority commit")
+    expected_summary_keys = {
+        "evidence_status",
+        "reported_cargo_command",
+        "reported_phase",
+        "reported_windows_msvc_environment",
+        "schema",
+        "source_contract",
+        "trust",
+    }
+    if (
+        set(candidate_build_input_summary) != expected_summary_keys
+        or candidate_build_input_summary.get("schema")
+        != build_input_sanitizer.SUMMARY_SCHEMA
+        or candidate_build_input_summary.get("source_contract")
+        != build_input_sanitizer.SOURCE_SCHEMA
+        or candidate_build_input_summary.get("trust")
+        != build_input_sanitizer.SUMMARY_TRUST
+        or candidate_build_input_summary.get("evidence_status")
+        != build_input_sanitizer.SUMMARY_EVIDENCE_STATUS
+    ):
+        raise ObservationError("candidate build-input summary is not the closed sanitizer output")
     replacements = _path_replacements(environment)
     budget = budget or HashBudget()
     selected_system = platform.system() if system is None else system
@@ -950,6 +977,9 @@ def build_observation(
     limitations = [
         "This observation is diagnostic canary evidence only; it is not a v1 builder record, "
         "provenance input, qualification result, approval, signature, or release authority.",
+        "The candidate build-input summary is a sanitized, path-free candidate-controlled "
+        "self-report excluded from release evidence; it is not an independent observation of "
+        "the compiler process.",
         "Cargo archive hashes describe the fresh cache contents but do not independently prove "
         "that unpacked dependency source trees remained unchanged during every compiler process.",
         *platform_limitations,
@@ -957,6 +987,7 @@ def build_observation(
     return {
         "authority_commit": authority_commit,
         "binary": binary_summary,
+        "candidate_build_input_summary": dict(candidate_build_input_summary),
         "cargo_registry_archive_cache": cargo_cache,
         "capture_limits": {
             "command_seconds": MAX_COMMAND_SECONDS,
@@ -1017,9 +1048,14 @@ def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--authority-commit", required=True)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--build-input-observation-dir", type=Path, required=True)
+    parser.add_argument("--build-temp", type=Path, required=True)
     parser.add_argument("--cargo-home", type=Path, required=True)
+    parser.add_argument("--expected-cargo", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--runner-temp", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--target", required=True)
     return parser.parse_args(arguments)
 
@@ -1027,12 +1063,34 @@ def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
 def main(arguments: Sequence[str] | None = None) -> int:
     options = _parse_arguments(arguments)
     try:
+        candidate_build_input_summary = (
+            build_input_sanitizer.consume_build_input_observation(
+                input_directory=options.build_input_observation_dir,
+                target=options.target,
+                source_commit=options.source_commit,
+                expected_cargo=os.fspath(options.expected_cargo),
+                source_root=os.fspath(options.source_root),
+                runner_temp=os.fspath(options.runner_temp),
+                build_temp=os.fspath(options.build_temp),
+                stage_directory=os.fspath(options.binary.parent),
+                cargo_home=os.fspath(options.cargo_home),
+                environment=os.environ,
+            )
+        )
+    except build_input_sanitizer.SanitizationError:
+        print(
+            "canary runner observation failed: private build-input observation could not be sanitized",
+            file=sys.stderr,
+        )
+        return 1
+    try:
         observation = build_observation(
             target=options.target,
             source_commit=options.source_commit,
             authority_commit=options.authority_commit,
             binary=options.binary,
             cargo_home=options.cargo_home,
+            candidate_build_input_summary=candidate_build_input_summary,
             environment=os.environ,
         )
         output = write_observation(options.output_dir, options.target, observation)
