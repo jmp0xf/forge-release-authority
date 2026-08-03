@@ -424,6 +424,29 @@ class BuildInputSanitizerTests(unittest.TestCase):
             _sanitize_windows(document)
         self.assertNotIn(sentinel, str(raised.exception))
         self.assertNotIn("secret-person", str(raised.exception))
+        self.assertEqual(raised.exception.diagnostic_code, "cargo-program")
+
+        document, _, _ = _windows_document()
+        document["cargo_command"]["working_directory"] = _windows_native(
+            r"D:\outside\source"
+        )
+        with self.assertRaises(sanitizer.SanitizationError) as raised:
+            _sanitize_windows(document)
+        self.assertEqual(raised.exception.diagnostic_code, "cargo-working-directory")
+
+        document, _, _ = _windows_document()
+        document["windows_msvc_environment"]["path"] = _windows_native(
+            r"relative\tool",
+            "windows-utf16le-base64",
+        )
+        with self.assertRaises(sanitizer.SanitizationError) as raised:
+            _sanitize_windows(document)
+        self.assertEqual(raised.exception.diagnostic_code, "windows-environment")
+
+        self.assertTrue(
+            {"cargo-program", "cargo-working-directory", "windows-environment"}
+            <= sanitizer.DIAGNOSTIC_CODES
+        )
 
     def test_consume_removes_raw_on_success_and_malformed_input(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

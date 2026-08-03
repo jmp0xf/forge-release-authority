@@ -1077,9 +1077,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 environment=os.environ,
             )
         )
-    except build_input_sanitizer.SanitizationError:
+    except build_input_sanitizer.SanitizationError as error:
         print(
-            "canary runner observation failed: private build-input observation could not be sanitized",
+            "canary runner observation failed: private build-input observation could not "
+            f"be sanitized (reason={error.diagnostic_code})",
             file=sys.stderr,
         )
         return 1

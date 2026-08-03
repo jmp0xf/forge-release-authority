@@ -541,7 +541,7 @@ class CanaryObservationTests(unittest.TestCase):
                     observations.build_input_sanitizer,
                     "consume_build_input_observation",
                     side_effect=observations.build_input_sanitizer.SanitizationError(
-                        private_value
+                        private_value, diagnostic_code="cargo-working-directory"
                     ),
                 ),
                 mock.patch.object(observations, "build_observation") as build,
@@ -553,6 +553,7 @@ class CanaryObservationTests(unittest.TestCase):
             build.assert_not_called()
             write.assert_not_called()
             self.assertNotIn(private_value, stderr.getvalue())
+            self.assertIn("reason=cargo-working-directory", stderr.getvalue())
 
 
 if __name__ == "__main__":
