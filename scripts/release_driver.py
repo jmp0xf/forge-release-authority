@@ -25,8 +25,10 @@ from typing import (
 )
 
 if __package__:
+    from . import release_build_protocol as protocol
     from . import release_sandbox as sandbox
 else:
+    import release_build_protocol as protocol  # type: ignore[import-not-found,no-redef]
     import release_sandbox as sandbox  # type: ignore[import-not-found,no-redef]
 
 
@@ -72,7 +74,13 @@ _NEXT_STATE = {
 
 
 class CanaryOperations(Protocol):
-    """Authority-owned operations invoked by the platform-neutral kernel."""
+    """Authority-owned operations invoked by the platform-neutral kernel.
+
+    The remaining ``object`` payloads are private lifecycle placeholders, not
+    domain values.  Before any concrete backend or workflow consumer exists,
+    BOOTSTRAP, EXECUTE, and APPLY must gain exact pinned-executable, execution,
+    and applied-target values that every consumer revalidates.
+    """
 
     def bootstrap(
         self, permit: sandbox.SandboxPermit
@@ -82,19 +90,19 @@ class CanaryOperations(Protocol):
         self,
         permit: sandbox.SandboxPermit,
         pinned_xtask: sandbox.SandboxPhaseCapture[object],
-    ) -> sandbox.SandboxProvisionalCapture[object]: ...
+    ) -> sandbox.SandboxProvisionalCapture[protocol.AcceptedReleaseBuildPlan]: ...
 
     def execute(
         self,
         permit: sandbox.SandboxPermit,
-        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan],
     ) -> sandbox.SandboxProvisionalCapture[object]: ...
 
     def apply(
         self,
         permit: sandbox.SandboxPermit,
         pinned_xtask: sandbox.SandboxPhaseCapture[object],
-        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan],
         execution_capture: sandbox.SandboxPhaseCapture[object],
     ) -> sandbox.SandboxProvisionalCapture[object]: ...
 
@@ -269,6 +277,7 @@ class CanaryDriver:
                 sandbox.Phase.PLAN,
                 lambda permit: self._operations.plan(permit, pinned_xtask),
             )
+            protocol.require_accepted_release_build_plan(accepted_plan.value)
             self._transition(DriverState.BOOTSTRAPPED, DriverState.PLAN_ACCEPTED)
 
             execution_capture = self._run_phase(
@@ -330,14 +339,14 @@ class _UnavailableOperations:
         self,
         permit: sandbox.SandboxPermit,
         pinned_xtask: sandbox.SandboxPhaseCapture[object],
-    ) -> sandbox.SandboxProvisionalCapture[object]:
+    ) -> sandbox.SandboxProvisionalCapture[protocol.AcceptedReleaseBuildPlan]:
         del permit, pinned_xtask
         raise DriverDiscardedError("canary operations unavailable")
 
     def execute(
         self,
         permit: sandbox.SandboxPermit,
-        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan],
     ) -> sandbox.SandboxProvisionalCapture[object]:
         del permit, accepted_plan
         raise DriverDiscardedError("canary operations unavailable")
@@ -346,7 +355,7 @@ class _UnavailableOperations:
         self,
         permit: sandbox.SandboxPermit,
         pinned_xtask: sandbox.SandboxPhaseCapture[object],
-        accepted_plan: sandbox.SandboxPhaseCapture[object],
+        accepted_plan: sandbox.SandboxPhaseCapture[protocol.AcceptedReleaseBuildPlan],
         execution_capture: sandbox.SandboxPhaseCapture[object],
     ) -> sandbox.SandboxProvisionalCapture[object]:
         del permit, pinned_xtask, accepted_plan, execution_capture
