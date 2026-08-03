@@ -448,6 +448,33 @@ class BuildInputSanitizerTests(unittest.TestCase):
             <= sanitizer.DIAGNOSTIC_CODES
         )
 
+    def test_cleanup_failure_replaces_an_in_progress_diagnostic_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner_temp = root / "runner-temp"
+            raw_directory = runner_temp / sanitizer.RAW_DIRECTORY_NAME
+            runner_temp.mkdir()
+            raw_directory.mkdir()
+            unexpected = raw_directory / "unexpected"
+            unexpected.write_text("keep", encoding="utf-8")
+
+            with self.assertRaises(sanitizer.SanitizationError) as raised:
+                sanitizer.consume_build_input_observation(
+                    input_directory=raw_directory,
+                    target=UNIX_TARGETS[0],
+                    source_commit=SOURCE_COMMIT,
+                    expected_cargo=os.fspath(root / "tool" / "cargo"),
+                    source_root=os.fspath(root / "source"),
+                    runner_temp=os.fspath(runner_temp),
+                    build_temp=os.fspath(runner_temp / "forge-private-build-temp"),
+                    stage_directory=os.fspath(root / "stage"),
+                    cargo_home=os.fspath(root / "cargo-home"),
+                    environment={},
+                )
+
+            self.assertEqual(raised.exception.diagnostic_code, "cleanup")
+            self.assertEqual(unexpected.read_text(encoding="utf-8"), "keep")
+
     def test_consume_removes_raw_on_success_and_malformed_input(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
