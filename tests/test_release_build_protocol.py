@@ -230,6 +230,28 @@ class ReleaseBuildProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(protocol.ProtocolError, "absolute path"):
             accepted.execution.cargo_build_arguments("relative-target")
 
+    def test_public_validator_rechecks_and_preserves_the_exact_plan(self) -> None:
+        accepted = self.accepted_plan()
+        self.assertIs(protocol.require_accepted_release_build_plan(accepted), accepted)
+
+        for value in (
+            object(),
+            replace(accepted, plan_sha256="f" * 64),
+            replace(accepted, source_root="/authority/other-source"),
+        ):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.require_accepted_release_build_plan(value)
+
+        class AcceptedPlanSubclass(protocol.AcceptedReleaseBuildPlan):
+            pass
+
+        fields = {
+            name: getattr(accepted, name) for name in accepted.__dataclass_fields__
+        }
+        with self.assertRaisesRegex(protocol.ProtocolError, "exact accepted"):
+            protocol.require_accepted_release_build_plan(AcceptedPlanSubclass(**fields))
+
     def test_accepts_exactly_the_five_policy_targets(self) -> None:
         for target in self.policy["targets"]:
             with self.subTest(target=target["triple"]):
