@@ -36,6 +36,10 @@ def _windows_native(value: str, encoding: str = "windows-wide") -> dict[str, str
     }
 
 
+def _extended_windows_local_path(value: str) -> str:
+    return "\\\\?\\" + value
+
+
 def _arguments(target: str, target_directory: str, *, windows: bool) -> list[dict[str, str]]:
     values = [
         "build",
@@ -352,6 +356,46 @@ class BuildInputSanitizerTests(unittest.TestCase):
         windows = summary["reported_windows_msvc_environment"]
         assert isinstance(windows, dict)
         self.assertEqual(windows["path"]["root_classes"], ["system"] * 3)
+
+    def test_windows_extended_local_drive_paths_match_plain_authority_roots(self) -> None:
+        document, paths, _ = _windows_document()
+        document["cargo_command"]["working_directory"] = _windows_native(
+            _extended_windows_local_path(paths["isolated_source"])
+        )
+        document["cargo_command"]["arguments"][-1] = _windows_native(
+            _extended_windows_local_path(paths["target_dir"])
+        )
+        document["windows_msvc_environment"]["path"] = _windows_native(
+            ";".join(
+                (
+                    _extended_windows_local_path(r"C:\Windows\System32"),
+                    _extended_windows_local_path(r"D:\a\cargo-home\bin"),
+                )
+            ),
+            "windows-utf16le-base64",
+        )
+
+        summary = _sanitize_windows(document)
+        windows = summary["reported_windows_msvc_environment"]
+        assert isinstance(windows, dict)
+        self.assertEqual(windows["path"]["root_classes"], ["system", "cargo-home"])
+        self.assertEqual(
+            summary["reported_cargo_command"]["working_directory_profile"],
+            "absolute-under-authority-build-temp-isolated-source",
+        )
+
+    def test_windows_non_local_namespaces_and_drive_relative_paths_are_rejected(self) -> None:
+        for path in (
+            r"\\server\share\source",
+            r"\\.\D:\private-build\source",
+            r"\\?\UNC\server\share\source",
+            r"D:private-build\source",
+        ):
+            with self.subTest(path=path):
+                document, _, _ = _windows_document()
+                document["cargo_command"]["working_directory"] = _windows_native(path)
+                with self.assertRaises(sanitizer.SanitizationError):
+                    _sanitize_windows(document)
 
     def test_native_decoding_rejects_noncanonical_nul_odd_and_oversize_values(self) -> None:
         document, _, _ = _windows_document()

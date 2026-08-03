@@ -44,6 +44,7 @@ TARGETS = {
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
 LOWER_GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 WINDOWS_DRIVE_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/].*\Z")
+WINDOWS_EXTENDED_DRIVE_ABSOLUTE = re.compile(r"\\\\\?\\([A-Za-z]:\\.*)\Z")
 EXPECTED_ARGUMENTS_BEFORE_TARGET_DIRECTORY = (
     "build",
     "--release",
@@ -291,10 +292,18 @@ def _native_path(value: str, target: str) -> bytes | str:
     return value if target == WINDOWS_TARGET else os.fsencode(value)
 
 
+def _windows_local_disk_spelling(value: str) -> str | None:
+    if WINDOWS_DRIVE_ABSOLUTE.fullmatch(value) is not None:
+        return value
+    extended = WINDOWS_EXTENDED_DRIVE_ABSOLUTE.fullmatch(value)
+    return extended.group(1) if extended is not None else None
+
+
 def _normalized_native_path(value: bytes | str, target: str) -> bytes | str:
     if target == WINDOWS_TARGET:
         assert isinstance(value, str)
-        return ntpath.normcase(ntpath.normpath(value))
+        local = _windows_local_disk_spelling(value)
+        return ntpath.normcase(ntpath.normpath(local if local is not None else value))
     assert isinstance(value, bytes)
     return posixpath.normpath(value)
 
@@ -302,7 +311,7 @@ def _normalized_native_path(value: bytes | str, target: str) -> bytes | str:
 def _is_absolute_native_path(value: bytes | str, target: str) -> bool:
     if target == WINDOWS_TARGET:
         assert isinstance(value, str)
-        return WINDOWS_DRIVE_ABSOLUTE.fullmatch(value) is not None
+        return _windows_local_disk_spelling(value) is not None
     assert isinstance(value, bytes)
     return posixpath.isabs(value)
 
@@ -310,7 +319,8 @@ def _is_absolute_native_path(value: bytes | str, target: str) -> bool:
 def _native_basename(value: bytes | str, target: str) -> bytes | str:
     if target == WINDOWS_TARGET:
         assert isinstance(value, str)
-        return ntpath.basename(ntpath.normpath(value))
+        local = _windows_local_disk_spelling(value)
+        return ntpath.basename(ntpath.normpath(local if local is not None else value))
     assert isinstance(value, bytes)
     return posixpath.basename(posixpath.normpath(value))
 
@@ -438,7 +448,8 @@ def _validate_cargo_command(
 
 
 def _windows_path_key(value: str) -> str:
-    return ntpath.normcase(ntpath.normpath(value))
+    local = _windows_local_disk_spelling(value)
+    return ntpath.normcase(ntpath.normpath(local if local is not None else value))
 
 
 def _windows_path_is_within(candidate: str, root: str) -> bool:
@@ -460,7 +471,8 @@ def _classify_windows_path(
     runner_temp: str,
     cargo_home: str,
 ) -> str:
-    if WINDOWS_DRIVE_ABSOLUTE.fullmatch(value) is None:
+    local = _windows_local_disk_spelling(value)
+    if local is None:
         raise SanitizationError("reported Windows environment contains a relative path")
 
     ordered_roots = (
@@ -475,13 +487,13 @@ def _classify_windows_path(
         (environment.get("ProgramData", ""), "program-data"),
     )
     for root, root_class in ordered_roots:
-        if _windows_path_is_within(value, root):
+        if _windows_path_is_within(local, root):
             return root_class
 
     for key in ("ProgramFiles(x86)", "ProgramFiles"):
         root = environment.get(key, "")
-        if _windows_path_is_within(value, root):
-            relative = ntpath.relpath(_windows_path_key(value), _windows_path_key(root))
+        if _windows_path_is_within(local, root):
+            relative = ntpath.relpath(_windows_path_key(local), _windows_path_key(root))
             if relative.startswith("microsoft visual studio\\"):
                 return "visual-studio"
             if relative.startswith("windows kits\\"):
@@ -490,7 +502,7 @@ def _classify_windows_path(
                 return "git"
             return "program-files"
 
-    folded = _windows_path_key(value).replace("/", "\\")
+    folded = _windows_path_key(local).replace("/", "\\")
     drive, tail = ntpath.splitdrive(folded)
     first = next((part for part in tail.split("\\") if part), "")
     if first == "hostedtoolcache":
