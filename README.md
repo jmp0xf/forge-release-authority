@@ -39,6 +39,15 @@ disclosure and diagnostic shape, not candidate authority. Before any later relea
 stable inputs and signer-builder identity must be frozen or conservatively verified in a separately reviewed v2 policy
 and verifier change.
 
+The separate `.github/workflows/linux-sandbox-observer.yml` workflow is an Authority-only, protected-main diagnostic.
+It accepts no input, never checks out or runs Forge, and gives a fixed Authority probe temporary root access on each
+Linux runner architecture without any release, attestation, protected-environment, secret, or artifact permission. It
+publishes only one of `CASE_OBSERVED`, `UNAVAILABLE`, `UNKNOWN`, or `CLEANUP_UNCONFIRMED` as a fixed log line. Only the
+first result passes, and it establishes only the probe's atomic cgroup leaf placement and namespace-relative membership
+case; it does not establish a sandbox backend, implementation profile, builder record, handoff, qualification, or
+release result. Any failed or incomplete observer attempt requires a fresh dispatch from protected `main`; a GitHub
+re-run is rejected rather than treated as replacement evidence.
+
 The stable provenance identities are documented by the
 [Forge qualification build type](docs/build-types/qualify-v1.md) and the
 [protected GitHub Actions builder](docs/builders/github-actions-protected-v1.md). These contracts define how to
