@@ -28,6 +28,16 @@ EXACT_OUTPUT_TEST_BUDGETS = {
 
 
 class ReleaseIoPosixTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "posix", "requires a native non-POSIX runtime")
+    def test_native_non_posix_import_is_safe_and_operations_fail_closed(self) -> None:
+        self.assertIs(posix_io.VerificationError, _release_io.VerificationError)
+        self.assertEqual(
+            _release_io.require_safe_basename("forge.exe", "artifact name"),
+            "forge.exe",
+        )
+        with self.assertRaisesRegex(posix_io.VerificationError, "POSIX"):
+            posix_io.pin_directory(Path.cwd(), "native non-POSIX probe")
+
     def test_secure_posix_capabilities_fail_closed(self) -> None:
         with mock.patch.object(os, "name", "nt"):
             with self.assertRaisesRegex(posix_io.VerificationError, "POSIX"):

@@ -102,3 +102,4 @@ jobs:
           tests.test_sanitize_build_input_observation.BuildInputSanitizerTests.test_windows_consume_removes_raw_and_preserves_only_summary
           tests.test_sanitize_build_input_observation.BuildInputSanitizerTests.test_cleanup_removes_fixed_raw_before_reporting_entry_overflow
           tests.test_sanitize_build_input_observation.BuildInputSanitizerTests.test_windows_paths_require_drive_absolute_and_do_not_trust_substrings
+          tests.test_release_io_posix.ReleaseIoPosixTests.test_native_non_posix_import_is_safe_and_operations_fail_closed

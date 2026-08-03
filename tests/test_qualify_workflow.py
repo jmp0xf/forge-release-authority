@@ -110,6 +110,10 @@ class QualifyWorkflowTests(unittest.TestCase):
             "test_windows_paths_require_drive_absolute_and_do_not_trust_substrings",
             windows,
         )
+        self.assertIn(
+            "test_native_non_posix_import_is_safe_and_operations_fail_closed",
+            windows,
+        )
 
     def test_only_protected_job_has_signing_permissions(self) -> None:
         workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")
