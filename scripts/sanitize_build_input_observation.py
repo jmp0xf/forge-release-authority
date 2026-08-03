@@ -74,10 +74,43 @@ WINDOWS_ROOT_CLASSES = {
     "windows-sdk",
     "workspace",
 }
+DIAGNOSTIC_CODES = frozenset(
+    {
+        "cargo-arguments",
+        "cargo-build-temp",
+        "cargo-command",
+        "cargo-program",
+        "cargo-target-directory",
+        "cargo-working-directory",
+        "cleanup",
+        "document-contract",
+        "input-io",
+        "input-json",
+        "unknown",
+        "windows-environment",
+    }
+)
 
 
 class SanitizationError(ValueError):
     """A private observation is unsafe, malformed, inconsistent, or unbounded."""
+
+    def __init__(self, message: str, *, diagnostic_code: str = "unknown") -> None:
+        if diagnostic_code not in DIAGNOSTIC_CODES:
+            raise ValueError("sanitization diagnostic code is outside the closed vocabulary")
+        super().__init__(message)
+        self.diagnostic_code = diagnostic_code
+
+
+def _with_diagnostic_code(
+    error: SanitizationError, diagnostic_code: str
+) -> SanitizationError:
+    selected = (
+        error.diagnostic_code
+        if error.diagnostic_code != "unknown"
+        else diagnostic_code
+    )
+    return SanitizationError(str(error), diagnostic_code=selected)
 
 
 def _is_reparse_point(metadata: os.stat_result) -> bool:
@@ -360,11 +393,17 @@ def _validate_cargo_command(
     )
     program = _native_value(command["program"], target, "reported Cargo program")
     if program != _native_path(expected_cargo, target):
-        raise SanitizationError("reported Cargo program differs from the authority selection")
+        raise SanitizationError(
+            "reported Cargo program differs from the authority selection",
+            diagnostic_code="cargo-program",
+        )
 
     arguments_raw = command["arguments"]
     if not isinstance(arguments_raw, list) or len(arguments_raw) != 13:
-        raise SanitizationError("reported Cargo argument count is unexpected")
+        raise SanitizationError(
+            "reported Cargo argument count is unexpected",
+            diagnostic_code="cargo-arguments",
+        )
     arguments = [
         _native_value(argument, target, "reported Cargo argument")
         for argument in arguments_raw
@@ -378,11 +417,17 @@ def _validate_cargo_command(
         )
     ]
     if arguments[:-1] != expected:
-        raise SanitizationError("reported Cargo arguments differ from the frozen profile")
+        raise SanitizationError(
+            "reported Cargo arguments differ from the frozen profile",
+            diagnostic_code="cargo-arguments",
+        )
 
     target_directory = arguments[-1]
     if not _is_absolute_native_path(target_directory, target):
-        raise SanitizationError("reported Cargo target directory is not absolute")
+        raise SanitizationError(
+            "reported Cargo target directory is not absolute",
+            diagnostic_code="cargo-target-directory",
+        )
     roots = (source_root, stage_directory, cargo_home, raw_directory)
     native_build_temp = _native_path(build_temp, target)
     if (
@@ -398,13 +443,19 @@ def _validate_cargo_command(
             for root in roots
         )
     ):
-        raise SanitizationError("authority build temp root is not isolated")
+        raise SanitizationError(
+            "authority build temp root is not isolated",
+            diagnostic_code="cargo-build-temp",
+        )
     if any(
         _is_within_native_path(target_directory, _native_path(root, target), target)
         or _is_within_native_path(_native_path(root, target), target_directory, target)
         for root in roots
     ):
-        raise SanitizationError("reported Cargo target directory is not disjoint")
+        raise SanitizationError(
+            "reported Cargo target directory is not disjoint",
+            diagnostic_code="cargo-target-directory",
+        )
 
     working_directory = _native_value(
         command["working_directory"], target, "reported Cargo working directory"
@@ -429,13 +480,15 @@ def _validate_cargo_command(
         or _is_within_native_path(target_directory, working_directory, target)
     ):
         raise SanitizationError(
-            "reported Cargo working directory is not one isolated source checkout"
+            "reported Cargo working directory is not one isolated source checkout",
+            diagnostic_code="cargo-working-directory",
         )
     if not _is_within_native_path(
         target_directory, native_build_temp, target
     ):
         raise SanitizationError(
-            "reported Cargo target directory is outside the authority build temp root"
+            "reported Cargo target directory is outside the authority build temp root",
+            diagnostic_code="cargo-target-directory",
         )
     return {
         "argument_count": 13,
@@ -597,43 +650,52 @@ def sanitize_document(
         raise SanitizationError("target is outside the five-target canary matrix")
     if LOWER_GIT_SHA.fullmatch(source_commit) is None:
         raise SanitizationError("source commit is not a full lowercase Git SHA")
-    root = _require_exact_keys(
-        document,
-        {
-            "schema",
-            "purpose",
-            "phase",
-            "source_commit",
-            "target",
-            "cargo_command",
-            "windows_msvc_environment",
-        },
-        "private observation",
-    )
-    _require_string(root["schema"], SOURCE_SCHEMA, "private observation schema")
-    _require_string(root["purpose"], SOURCE_PURPOSE, "private observation purpose")
-    _require_string(root["phase"], SOURCE_PHASE, "private observation phase")
-    _require_string(root["target"], target, "private observation target")
-    _validate_source_identity(root["source_commit"], source_commit)
-    cargo = _validate_cargo_command(
-        root["cargo_command"],
-        target=target,
-        expected_cargo=expected_cargo,
-        source_root=source_root,
-        runner_temp=runner_temp,
-        build_temp=build_temp,
-        stage_directory=stage_directory,
-        cargo_home=cargo_home,
-        raw_directory=raw_directory,
-    )
-    windows_environment = _validate_windows_environment(
-        root["windows_msvc_environment"],
-        target=target,
-        environment=environment,
-        source_root=source_root,
-        runner_temp=runner_temp,
-        cargo_home=cargo_home,
-    )
+    try:
+        root = _require_exact_keys(
+            document,
+            {
+                "schema",
+                "purpose",
+                "phase",
+                "source_commit",
+                "target",
+                "cargo_command",
+                "windows_msvc_environment",
+            },
+            "private observation",
+        )
+        _require_string(root["schema"], SOURCE_SCHEMA, "private observation schema")
+        _require_string(root["purpose"], SOURCE_PURPOSE, "private observation purpose")
+        _require_string(root["phase"], SOURCE_PHASE, "private observation phase")
+        _require_string(root["target"], target, "private observation target")
+        _validate_source_identity(root["source_commit"], source_commit)
+    except SanitizationError as error:
+        raise _with_diagnostic_code(error, "document-contract") from error
+    try:
+        cargo = _validate_cargo_command(
+            root["cargo_command"],
+            target=target,
+            expected_cargo=expected_cargo,
+            source_root=source_root,
+            runner_temp=runner_temp,
+            build_temp=build_temp,
+            stage_directory=stage_directory,
+            cargo_home=cargo_home,
+            raw_directory=raw_directory,
+        )
+    except SanitizationError as error:
+        raise _with_diagnostic_code(error, "cargo-command") from error
+    try:
+        windows_environment = _validate_windows_environment(
+            root["windows_msvc_environment"],
+            target=target,
+            environment=environment,
+            source_root=source_root,
+            runner_temp=runner_temp,
+            cargo_home=cargo_home,
+        )
+    except SanitizationError as error:
+        raise _with_diagnostic_code(error, "windows-environment") from error
     return {
         "evidence_status": SUMMARY_EVIDENCE_STATUS,
         "reported_cargo_command": cargo,
@@ -821,8 +883,14 @@ def consume_build_input_observation(
     directory = _expected_raw_directory(input_directory, Path(runner_temp))
     raw_path = directory / f"{RAW_FILE_PREFIX}{target}.json"
     try:
-        raw = _read_bounded_stable_regular_file(raw_path)
-        document = _parse_document(raw)
+        try:
+            raw = _read_bounded_stable_regular_file(raw_path)
+        except SanitizationError as error:
+            raise _with_diagnostic_code(error, "input-io") from error
+        try:
+            document = _parse_document(raw)
+        except SanitizationError as error:
+            raise _with_diagnostic_code(error, "input-json") from error
         return sanitize_document(
             document,
             target=target,
@@ -837,7 +905,10 @@ def consume_build_input_observation(
             environment=environment,
         )
     finally:
-        cleanup_raw_namespace(directory, Path(runner_temp), target)
+        try:
+            cleanup_raw_namespace(directory, Path(runner_temp), target)
+        except SanitizationError as error:
+            raise _with_diagnostic_code(error, "cleanup") from error
 
 
 def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
@@ -853,8 +924,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     options = _parse_arguments(arguments)
     try:
         cleanup_raw_namespace(options.input_dir, options.runner_temp, options.target)
-    except SanitizationError as error:
-        print(f"private build-input cleanup failed: {error}", file=sys.stderr)
+    except SanitizationError:
+        print("private build-input cleanup failed (reason=cleanup)", file=sys.stderr)
         return 1
     return 0
 
