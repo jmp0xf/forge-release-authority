@@ -441,12 +441,62 @@ class BuildInputSanitizerTests(unittest.TestCase):
         )
         with self.assertRaises(sanitizer.SanitizationError) as raised:
             _sanitize_windows(document)
-        self.assertEqual(raised.exception.diagnostic_code, "windows-environment")
+        self.assertEqual(raised.exception.diagnostic_code, "windows-path-namespace")
 
         self.assertTrue(
-            {"cargo-program", "cargo-working-directory", "windows-environment"}
+            {
+                "cargo-program",
+                "cargo-working-directory",
+                "windows-path-namespace",
+            }
             <= sanitizer.DIAGNOSTIC_CODES
         )
+
+    def test_windows_environment_failure_codes_are_content_free_and_specific(self) -> None:
+        mutations = (
+            (
+                "contract",
+                "windows-environment-contract",
+                lambda environment: environment.__setitem__("extra", "private-sentinel"),
+            ),
+            (
+                "encoding",
+                "windows-environment-encoding",
+                lambda environment: environment["path"].__setitem__(
+                    "raw_base64", "%%%private-sentinel%%%"
+                ),
+            ),
+            (
+                "path list shape",
+                "windows-path-list-shape",
+                lambda environment: environment.__setitem__(
+                    "path",
+                    _windows_native(
+                        r"C:\Windows\System32;;C:\Windows",
+                        "windows-utf16le-base64",
+                    ),
+                ),
+            ),
+            (
+                "namespace",
+                "windows-path-namespace",
+                lambda environment: environment.__setitem__(
+                    "path",
+                    _windows_native(
+                        r"\\server\private-sentinel\bin",
+                        "windows-utf16le-base64",
+                    ),
+                ),
+            ),
+        )
+        for label, expected_code, mutate in mutations:
+            with self.subTest(label=label):
+                document, _, _ = _windows_document()
+                mutate(document["windows_msvc_environment"])
+                with self.assertRaises(sanitizer.SanitizationError) as raised:
+                    _sanitize_windows(document)
+                self.assertEqual(raised.exception.diagnostic_code, expected_code)
+                self.assertNotIn("private-sentinel", str(raised.exception))
 
     def test_cleanup_failure_replaces_an_in_progress_diagnostic_code(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
