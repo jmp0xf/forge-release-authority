@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import inspect
 import io
 import pickle
@@ -169,19 +170,18 @@ class ReleaseDriverTests(unittest.TestCase):
             with self.assertRaises(sandbox.SandboxContractError):
                 permit.require_active(permit.phase)
 
-        expected_report: dict[str, driver.CanaryReportValue] = {
-            "builder_record_written": False,
-            "evidence_status": "excluded-from-release-evidence",
-            "handoff_written": False,
-            "purpose": "inactive-canary-diagnostic-only",
-            "qualification_eligible": False,
-        }
+        expected_report = driver.CanaryReport()
         self.assertEqual(report, expected_report)
         self.assertEqual(canary.report, expected_report)
         self.assertEqual(canary.state, driver.DriverState.CANARY_REPORTED)
-
-        report["purpose"] = "mutated"
-        self.assertEqual(canary.report, expected_report)
+        self.assertIs(canary.report, report)
+        self.assertFalse(report.builder_record_written)
+        self.assertEqual(report.evidence_status, "excluded-from-release-evidence")
+        self.assertFalse(report.handoff_written)
+        self.assertEqual(report.purpose, "inactive-canary-diagnostic-only")
+        self.assertFalse(report.qualification_eligible)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            setattr(report, "qualification_eligible", True)
 
     def test_permits_are_live_session_bound_and_never_created_from_json(self) -> None:
         events: list[str] = []
@@ -341,9 +341,9 @@ class ReleaseDriverTests(unittest.TestCase):
                 "bound",
                 "bootstrapped",
                 "plan-accepted",
-                "execute-pending",
+                "execution-captured",
                 "apply-captured",
-                "target-verified",
+                "canary-target-checked",
                 "canary-reported",
                 "discarded",
             ],

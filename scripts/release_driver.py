@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Protocol, Sequence, TypeVar, cast
+from typing import Callable, Literal, Protocol, Sequence, TypeVar, cast
 
 if __package__:
     from . import release_sandbox as sandbox
@@ -20,8 +21,12 @@ else:
     import release_sandbox as sandbox  # type: ignore[import-not-found,no-redef]
 
 
-CANARY_PURPOSE = "inactive-canary-diagnostic-only"
-CANARY_EVIDENCE_STATUS = "excluded-from-release-evidence"
+CANARY_PURPOSE: Literal["inactive-canary-diagnostic-only"] = (
+    "inactive-canary-diagnostic-only"
+)
+CANARY_EVIDENCE_STATUS: Literal["excluded-from-release-evidence"] = (
+    "excluded-from-release-evidence"
+)
 
 
 class DriverError(RuntimeError):
@@ -40,9 +45,9 @@ class DriverState(str, Enum):
     BOUND = "bound"
     BOOTSTRAPPED = "bootstrapped"
     PLAN_ACCEPTED = "plan-accepted"
-    EXECUTE_PENDING = "execute-pending"
+    EXECUTION_CAPTURED = "execution-captured"
     APPLY_CAPTURED = "apply-captured"
-    TARGET_VERIFIED = "target-verified"
+    CANARY_TARGET_CHECKED = "canary-target-checked"
     CANARY_REPORTED = "canary-reported"
     DISCARDED = "discarded"
 
@@ -50,10 +55,10 @@ class DriverState(str, Enum):
 _NEXT_STATE = {
     DriverState.BOUND: DriverState.BOOTSTRAPPED,
     DriverState.BOOTSTRAPPED: DriverState.PLAN_ACCEPTED,
-    DriverState.PLAN_ACCEPTED: DriverState.EXECUTE_PENDING,
-    DriverState.EXECUTE_PENDING: DriverState.APPLY_CAPTURED,
-    DriverState.APPLY_CAPTURED: DriverState.TARGET_VERIFIED,
-    DriverState.TARGET_VERIFIED: DriverState.CANARY_REPORTED,
+    DriverState.PLAN_ACCEPTED: DriverState.EXECUTION_CAPTURED,
+    DriverState.EXECUTION_CAPTURED: DriverState.APPLY_CAPTURED,
+    DriverState.APPLY_CAPTURED: DriverState.CANARY_TARGET_CHECKED,
+    DriverState.CANARY_TARGET_CHECKED: DriverState.CANARY_REPORTED,
 }
 
 
@@ -79,19 +84,23 @@ class CanaryOperations(Protocol):
     def verify_target(self, apply_capture: object) -> None: ...
 
 
-CanaryReportValue = str | bool
 _Result = TypeVar("_Result")
 _MISSING = object()
 
 
-def _canary_report() -> dict[str, CanaryReportValue]:
-    return {
-        "builder_record_written": False,
-        "evidence_status": CANARY_EVIDENCE_STATUS,
-        "handoff_written": False,
-        "purpose": CANARY_PURPOSE,
-        "qualification_eligible": False,
-    }
+@dataclass(frozen=True, slots=True)
+class CanaryReport:
+    """A nominal, immutable diagnostic result that can never authorize release."""
+
+    builder_record_written: Literal[False] = field(default=False, init=False)
+    evidence_status: Literal["excluded-from-release-evidence"] = field(
+        default=CANARY_EVIDENCE_STATUS, init=False
+    )
+    handoff_written: Literal[False] = field(default=False, init=False)
+    purpose: Literal["inactive-canary-diagnostic-only"] = field(
+        default=CANARY_PURPOSE, init=False
+    )
+    qualification_eligible: Literal[False] = field(default=False, init=False)
 
 
 class CanaryDriver:
@@ -107,7 +116,7 @@ class CanaryDriver:
             raise TypeError("canary backend must be Authority-owned")
         self._backend = backend
         self._operations = operations
-        self._report: dict[str, CanaryReportValue] | None = None
+        self._report: CanaryReport | None = None
         self._running = False
         self._state = DriverState.BOUND
 
@@ -116,8 +125,8 @@ class CanaryDriver:
         return self._state
 
     @property
-    def report(self) -> dict[str, CanaryReportValue] | None:
-        return None if self._report is None else dict(self._report)
+    def report(self) -> CanaryReport | None:
+        return self._report
 
     def _transition(self, expected: DriverState, target: DriverState) -> None:
         if self._state is not expected or _NEXT_STATE.get(expected) is not target:
@@ -164,7 +173,7 @@ class CanaryDriver:
             raise DriverDiscardedError("canary phase failed")
         return cast(_Result, result)
 
-    def run(self) -> dict[str, CanaryReportValue]:
+    def run(self) -> CanaryReport:
         """Run exactly one diagnostic canary; no qualification mode exists."""
         if self._running:
             self._discard()
@@ -188,7 +197,7 @@ class CanaryDriver:
                 sandbox.Phase.EXECUTE,
                 lambda permit: self._operations.execute(permit, accepted_plan),
             )
-            self._transition(DriverState.PLAN_ACCEPTED, DriverState.EXECUTE_PENDING)
+            self._transition(DriverState.PLAN_ACCEPTED, DriverState.EXECUTION_CAPTURED)
 
             apply_capture = self._run_phase(
                 sandbox.Phase.APPLY,
@@ -199,15 +208,19 @@ class CanaryDriver:
                     execution_capture,
                 ),
             )
-            self._transition(DriverState.EXECUTE_PENDING, DriverState.APPLY_CAPTURED)
+            self._transition(DriverState.EXECUTION_CAPTURED, DriverState.APPLY_CAPTURED)
 
             self._operations.verify_target(apply_capture)
-            self._transition(DriverState.APPLY_CAPTURED, DriverState.TARGET_VERIFIED)
+            self._transition(
+                DriverState.APPLY_CAPTURED, DriverState.CANARY_TARGET_CHECKED
+            )
 
-            report = _canary_report()
-            self._transition(DriverState.TARGET_VERIFIED, DriverState.CANARY_REPORTED)
+            report = CanaryReport()
+            self._transition(
+                DriverState.CANARY_TARGET_CHECKED, DriverState.CANARY_REPORTED
+            )
             self._report = report
-            return dict(report)
+            return report
         except BaseException:
             self._discard()
             raise DriverDiscardedError("release canary discarded") from None
@@ -219,7 +232,7 @@ def run_canary(
     *,
     backend: sandbox.AuthoritySandboxBackend,
     operations: CanaryOperations,
-) -> dict[str, CanaryReportValue]:
+) -> CanaryReport:
     """Authority API for the sole supported mode: a non-proof canary."""
     return CanaryDriver(backend=backend, operations=operations).run()
 
