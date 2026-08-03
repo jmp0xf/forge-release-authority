@@ -139,13 +139,16 @@ native canary observation is reachable in Stage A:
 4. An independent unprivileged job checks out only the authority repository and runs the same verifier over fresh
    copies of the finalized bytes. Its deterministic outputs are a preview, not signing authority, and are not trusted
    by the protected job.
-5. The protected job checks out only the authority repository. Its standard-library-only verifier uses the GitHub Git
-   Data API at fixed numeric repository identities to resolve each exact commit, tree, and regular blob. It rejects
-   redirects, mutable refs, symlinks, submodules, executable source-material modes, identity drift, truncation, digest
-   mismatch, or resource-limit violations. It fetches `Cargo.lock` and `THIRD-PARTY-LICENSES.txt` itself, and verifies
-   that the running policy and verifier bytes match the protected authority commit. It does not import Forge code, run
-   Cargo or xtask, or execute candidate binaries. It then independently verifies the exact file sets, manifest,
-   checksums, SBOM graph and licenses, native executable structures, and builder records.
+5. The protected job checks out only the authority repository. Its standard-library-only bootstrap verifier uses the
+   GitHub Git Data API at fixed numeric repository identities to resolve each exact commit, tree, and regular blob. It
+   rejects redirects, mutable refs, symlinks, submodules, executable source-material modes, identity drift, truncation,
+   digest mismatch, or resource-limit violations. It fetches `Cargo.lock` and `THIRD-PARTY-LICENSES.txt` itself. The
+   policy, bootstrap verifier, portable exact-I/O contracts, and POSIX exact-I/O adapter form one closed four-file
+   Authority runtime. The bootstrap reads and verifies every local runtime byte against the protected authority commit
+   before compiling and executing both adapters directly from the protected bytes; after binding, all non-bootstrap
+   qualification input and output I/O goes through the bound adapter modules and their narrow facade. It does not
+   import Forge code, run Cargo or xtask, or execute candidate binaries. It then independently verifies the exact file
+   sets, manifest, checksums, SBOM graph and licenses, native executable structures, and builder records.
 6. The verifier emits a deterministic predicate plus checksums for all thirteen subjects. A pinned attestation action
    may wrap them in an in-toto Statement only after protected-environment approval. Publication is a later,
    create-only operation and is not part of this build type.
@@ -194,6 +197,12 @@ The v1 verifier applies these policy limits before semantic parsing:
 | One builder record | 64 KiB |
 | All release assets | 192 MiB |
 | All builder records | 256 KiB |
+| Authority policy | 1 MiB |
+| Portable exact-I/O contracts | 1 MiB |
+| POSIX exact-I/O adapter | 4 MiB |
+| Bootstrap verifier | 4 MiB |
+| Complete Authority runtime | 10 MiB |
+| One GitHub API JSON response | 20 MiB |
 
 It additionally caps an SBOM at 512 components and 4,096 dependency edges, ELF at 128 program headers and 1 MiB of
 dynamic tables, Mach-O at 256 load commands and 1 MiB of load-command bytes, and PE at 96 sections. Directory
@@ -205,6 +214,11 @@ Qualification output directories must initially be empty, owned by the verifier 
 process running as that user may modify them. Outputs are create-only. Because two filesystem names cannot be committed
 as one portable transaction, a late failure may leave one sibling; discard the whole private directory and rerun in a
 new one.
+
+The portable exact-I/O library's immutable file-set value is a bounded flat observation of names, bytes, and digests.
+It is not evidence that an external producer directory was read-only or that the producer ran in a sandbox; those are
+separate environmental properties. Qualification instead relies on held filesystem handles, repeated identity and
+content checks, the private-directory preconditions above, and fail-closed process disposal.
 
 ## Complete example predicate
 

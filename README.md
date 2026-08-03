@@ -54,8 +54,18 @@ empty private directory. A failed, rejected, or incomplete GitHub workflow attem
 
 The production verifier accepts only finalized asset and builder-record directories plus the requested Forge commit.
 It derives the authority commit from an exact protected-main GitHub Actions context, reads policy from its own checkout,
-and resolves `Cargo.lock`, `THIRD-PARTY-LICENSES.txt`, policy, and verifier bytes through fixed GitHub repository IDs and
-commit/tree/blob objects. It has no path or commit option that can relabel arbitrary local bytes as trusted source.
+and resolves `Cargo.lock`, `THIRD-PARTY-LICENSES.txt`, and a closed four-file Authority runtime through fixed GitHub
+repository IDs and commit/tree/blob objects. That runtime is the policy, bootstrap verifier, portable exact-I/O
+contracts, and POSIX exact-I/O adapter. The bootstrap first verifies every local runtime byte, then compiles and
+executes both adapters directly from the protected bytes rather than consulting source paths or bytecode caches again.
+This establishes checkout/commit consistency and execution-byte binding under the
+already trusted protected workflow, checkout, CPython/standard-library interpreter, and initial bootstrap-verifier
+process. It is not an independent secure boot, sandbox, or defense against an arbitrary malicious component already
+executing in that same trusted process, and it does not exclude an external writer with the same user identity. The
+verifier has no path or commit option that can relabel arbitrary local bytes as trusted source.
+
+The supported verifier interface is its documented command line and workflow invocation. Python module symbols,
+including exact-I/O classes and helpers, are internal implementation details and are not a compatibility API.
 
 ## Security
 
