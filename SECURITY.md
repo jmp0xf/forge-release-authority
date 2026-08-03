@@ -10,3 +10,8 @@ credentials.
 This repository protects release policy; it is not a sandbox for untrusted candidate code. Candidate builds run with
 read-only repository permissions and without publication credentials. A protected environment gates attestation and
 publication authority.
+
+The Linux sandbox observer is a separate Authority-only diagnostic on a single-use hosted runner. Its root step must
+remain limited to the fixed Authority probe: do not add a Forge checkout, candidate-controlled input or command,
+publication credential, protected environment, or release handoff to that workflow. A successful fixed observation is
+not evidence that a candidate sandbox or release path is available.
