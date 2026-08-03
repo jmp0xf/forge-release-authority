@@ -1333,6 +1333,17 @@ def _validate_accepted_plan(plan: AcceptedReleaseBuildPlan) -> None:
     )
 
 
+def require_accepted_release_build_plan(
+    value: object,
+) -> AcceptedReleaseBuildPlan:
+    """Revalidate and return one exact Authority-accepted plan unchanged."""
+    if type(value) is not AcceptedReleaseBuildPlan:
+        raise ProtocolError("plan must be an exact accepted release-build plan")
+    plan = value
+    _validate_accepted_plan(plan)
+    return plan
+
+
 def accept_release_build_plan(
     plan_bytes: bytes,
     policy: Mapping[str, Any],
