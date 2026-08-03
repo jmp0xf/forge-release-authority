@@ -68,10 +68,7 @@ jobs:
               os.environ["SOURCE_COMMIT"],
               authority_commit,
           )
-          if materials.authority_policy != verifier.AUTHORITY_POLICY_PATH.read_bytes():
-              raise SystemExit("protected authority policy differs from this checkout")
-          if materials.authority_verifier != verifier.AUTHORITY_VERIFIER_PATH.read_bytes():
-              raise SystemExit("protected authority verifier differs from this checkout")
+          verifier._load_release_io(materials)
           PY
 
   native-build:

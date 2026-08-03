@@ -24,8 +24,8 @@ The builder identity represents the transitive closure of entities trusted to ex
 - GitHub's hosted Actions control plane and hosted runner images selected by the five policy-pinned runner labels;
 - the immutable owner and repository identities for `jmp0xf/forge-release-authority` (owner ID `2247932`, repository
   ID `1317240187`);
-- the protected `main` branch, reviewed authority commit, pinned external actions, authority policy, and independent
-  verifier;
+- the protected `main` branch, reviewed authority commit, pinned external actions, and the closed four-file Authority
+  runtime: policy, bootstrap verifier, portable exact-I/O contracts, and POSIX exact-I/O adapter;
 - the `forge-release` GitHub Environment and the human owner/legal approval required by ADR-0041;
 - GitHub's OIDC issuer `https://token.actions.githubusercontent.com`, the selected keyless attestation service, and
   the transparency log used by that service;
@@ -34,6 +34,13 @@ The builder identity represents the transitive closure of entities trusted to ex
 
 Forge candidate code is deliberately outside the trusted control plane. It is treated as untrusted workload input.
 The current single-owner arrangement is accountability, not independent second-person review.
+
+The protected workflow and checkout, selected CPython interpreter and standard library, and initially executing
+`verify_release.py` bootstrap are already inside this trust base. The bootstrap's protected-commit comparison of the
+four runtime files and exact-byte execution of the two adapter modules are drift, closure-consistency, and
+execution-source checks within that TCB. They are not an independent secure boot, do not sandbox the process, and
+cannot defend against an arbitrary malicious component already executing inside the same trusted process. Filesystem
+identity checks likewise do not exclude another writer with the same user identity.
 
 ## Permission-separated jobs
 
@@ -98,11 +105,13 @@ attestation permission, or release write. Candidate-generated checks remain usef
 ### Preflight and independent qualification jobs
 
 The preflight job binds both repositories to their immutable identities and protected public `main` heads before any
-candidate execution. After finalization, a separate unprivileged job checks out only the authority repository and
-runs the complete verifier over fresh copies of the downloaded files. Neither job receives a secret, OIDC token,
-protected environment, attestation permission, or release permission. The independent job's predicate and checksums
-are a deterministic preview only: the protected job downloads the original finalized artifacts, reruns the complete
-verifier in new private directories, and requires byte-for-byte equality before attestation.
+candidate execution. It resolves the complete four-file Authority runtime and verifies every checked-out runtime byte
+before either exact-I/O adapter is executed directly from its protected bytes. After finalization, a separate
+unprivileged job checks out only the authority repository and runs the complete verifier over fresh copies of the
+downloaded files. Neither job receives a secret, OIDC token, protected environment, attestation permission, or release
+permission. The independent job's predicate and checksums are a deterministic preview only: the protected job
+downloads the original finalized artifacts, reruns the complete verifier in new private directories, and requires
+byte-for-byte equality before attestation.
 The independent job is present but mechanically unreachable in Stage A.
 
 ### Protected attest job
@@ -117,8 +126,10 @@ The job runs only for `workflow_dispatch` on `refs/heads/main`. It derives the a
 requires the workflow commit and ref to match the protected `qualify.yml` on `main`, and checks out only that reviewed
 authority commit. It runs the authority's standard-library-only verifier over downloaded, finalized bytes in fresh
 private directories. The verifier resolves source materials through GitHub's fixed repository-ID commit/tree/blob API
-chain; it does not checkout Forge. The job must not run Cargo or xtask, invoke a Forge script, or execute a candidate
-binary. Candidate-controlled bytes therefore cannot execute in the process that holds signing identity.
+chain and binds its policy, bootstrap verifier, portable exact-I/O contracts, and POSIX exact-I/O adapter as one runtime
+closure before executing the adapters directly from the bound protected bytes; it does not checkout Forge. The job
+must not run Cargo or xtask, invoke a Forge script, or execute a candidate binary. Candidate-controlled bytes therefore
+cannot execute in the process that holds signing identity.
 
 Attestation and release publication are separate authorities. This builder does not create or mutate tags, releases,
 or release assets.
@@ -130,8 +141,8 @@ When this identity is active and an invocation succeeds, the protected control p
 - `buildDefinition.buildType` is the exact v1 qualification URI;
 - `externalParameters` contains only the caller-supplied Forge `sourceCommit`, which must equal the protected Forge
   `main` HEAD resolved by the verifier;
-- `internalParameters` is derived from the policy and verifier at the protected authority `main` commit selected by the
-  trusted Actions context;
+- `internalParameters` is derived from the policy and bound four-file Authority runtime at the protected authority
+  `main` commit selected by the trusted Actions context;
 - `resolvedDependencies` contains the exact Forge and authority commits plus SHA-256 descriptors for the
   source-bound `Cargo.lock` and `THIRD-PARTY-LICENSES.txt`;
 - the five builder-record byproducts match the frozen runner labels, Rust version, repository identities, commits,

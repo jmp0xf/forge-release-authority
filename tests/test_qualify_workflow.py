@@ -196,6 +196,13 @@ class QualifyWorkflowTests(unittest.TestCase):
             preflight.count('if os.environ["DISPATCH_MODE"] != "canary":'), 1
         )
         self.assertEqual(
+            preflight.count("verifier._load_release_io(materials)"),
+            1,
+        )
+        self.assertNotIn("verifier._verify_local_authority_runtime", preflight)
+        self.assertNotIn("AUTHORITY_POLICY_PATH.read_bytes()", preflight)
+        self.assertNotIn("AUTHORITY_VERIFIER_PATH.read_bytes()", preflight)
+        self.assertEqual(
             len(
                 re.findall(
                     r"^    if: \$\{\{ inputs\.mode == 'canary' \}\}$",
