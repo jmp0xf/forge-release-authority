@@ -88,6 +88,11 @@ DIAGNOSTIC_CODES = frozenset(
         "input-json",
         "unknown",
         "windows-environment",
+        "windows-environment-contract",
+        "windows-environment-encoding",
+        "windows-path-class",
+        "windows-path-list-shape",
+        "windows-path-namespace",
     }
 )
 
@@ -294,20 +299,34 @@ def _decode_unix_native(value: Any, label: str) -> bytes:
     return decoded
 
 
-def _decode_windows_native(value: Any, expected_encoding: str, label: str) -> str:
+def _decode_windows_native(
+    value: Any,
+    expected_encoding: str,
+    label: str,
+    *,
+    diagnostic_code: str = "unknown",
+) -> str:
     item = _require_exact_keys(value, {"encoding", "raw_base64"}, label)
     _require_string(item["encoding"], expected_encoding, f"{label} encoding")
-    decoded = _decode_canonical_base64(item["raw_base64"], label)
-    if len(decoded) % 2 != 0:
-        raise SanitizationError(f"{label} has an invalid Windows-native byte length")
-    if any(decoded[index : index + 2] == b"\0\0" for index in range(0, len(decoded), 2)):
-        raise SanitizationError(f"{label} contains a NUL code unit")
     try:
-        text = decoded.decode("utf-16-le", errors="strict")
-    except UnicodeError as error:
-        raise SanitizationError(f"{label} is not strict UTF-16LE") from error
-    if any(ord(character) < 32 or ord(character) == 127 for character in text):
-        raise SanitizationError(f"{label} contains a forbidden native character")
+        decoded = _decode_canonical_base64(item["raw_base64"], label)
+        if len(decoded) % 2 != 0:
+            raise SanitizationError(
+                f"{label} has an invalid Windows-native byte length"
+            )
+        if any(
+            decoded[index : index + 2] == b"\0\0"
+            for index in range(0, len(decoded), 2)
+        ):
+            raise SanitizationError(f"{label} contains a NUL code unit")
+        try:
+            text = decoded.decode("utf-16-le", errors="strict")
+        except UnicodeError as error:
+            raise SanitizationError(f"{label} is not strict UTF-16LE") from error
+        if any(ord(character) < 32 or ord(character) == 127 for character in text):
+            raise SanitizationError(f"{label} contains a forbidden native character")
+    except SanitizationError as error:
+        raise _with_diagnostic_code(error, diagnostic_code) from error
     return text
 
 
@@ -526,7 +545,10 @@ def _classify_windows_path(
 ) -> str:
     local = _windows_local_disk_spelling(value)
     if local is None:
-        raise SanitizationError("reported Windows environment contains a relative path")
+        raise SanitizationError(
+            "reported Windows environment contains a relative path",
+            diagnostic_code="windows-path-namespace",
+        )
 
     ordered_roots = (
         (source_root, "source-checkout"),
@@ -581,7 +603,10 @@ def _summarize_windows_path_list(
 ) -> dict[str, Any]:
     entries = value.split(";")
     if not entries or len(entries) > MAX_PATH_ENTRIES or any(not entry for entry in entries):
-        raise SanitizationError("reported Windows environment path-list shape is unexpected")
+        raise SanitizationError(
+            "reported Windows environment path-list shape is unexpected",
+            diagnostic_code="windows-path-list-shape",
+        )
     classes = [
         _classify_windows_path(
             entry,
@@ -593,7 +618,10 @@ def _summarize_windows_path_list(
         for entry in entries
     ]
     if any(root_class not in WINDOWS_ROOT_CLASSES for root_class in classes):
-        raise SanitizationError("reported Windows environment path class is unexpected")
+        raise SanitizationError(
+            "reported Windows environment path class is unexpected",
+            diagnostic_code="windows-path-class",
+        )
     return {"entry_count": len(entries), "root_classes": classes}
 
 
@@ -611,16 +639,22 @@ def _validate_windows_environment(
         _require_string(status["status"], "not-applicable", "reported MSVC status")
         return {"status": "reported-not-applicable"}
 
-    observed = _require_exact_keys(
-        value,
-        {"status", "path", "lib", "include"},
-        "reported MSVC environment",
-    )
-    _require_string(observed["status"], "observed", "reported MSVC status")
+    try:
+        observed = _require_exact_keys(
+            value,
+            {"status", "path", "lib", "include"},
+            "reported MSVC environment",
+        )
+        _require_string(observed["status"], "observed", "reported MSVC status")
+    except SanitizationError as error:
+        raise _with_diagnostic_code(error, "windows-environment-contract") from error
     result: dict[str, Any] = {"status": "reported-observed"}
     for name in ("path", "lib", "include"):
         decoded = _decode_windows_native(
-            observed[name], "windows-utf16le-base64", f"reported MSVC {name}"
+            observed[name],
+            "windows-utf16le-base64",
+            f"reported MSVC {name}",
+            diagnostic_code="windows-environment-encoding",
         )
         result[name] = _summarize_windows_path_list(
             decoded,
