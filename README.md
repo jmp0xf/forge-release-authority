@@ -18,12 +18,26 @@ qualification, attestation, approval, publication, or withdrawal rules that judg
 
 ## Status
 
-The repository is being bootstrapped. The permission-separated `.github/workflows/qualify.yml` is installed for an
-inactive canary, but it must not be treated as release qualification. Before activation, hosted controls must be
-verified and a non-release canary must record and freeze the actual runner inputs and signer-builder identity in a
-follow-up reviewed change. Each native canary job uploads a separate bounded runner-observation diagnostic for that
-review; these files are not builder records, provenance byproducts, protected-job inputs, approval, or release
-evidence. The repository does not yet tag, upload, or publish Forge releases.
+The repository is being bootstrapped. `.github/workflows/qualify.yml` is mechanically restricted to its required
+`mode=canary` choice. It runs preflight plus the five unprivileged native jobs, uploads only one sanitized runner
+observation per target, and keeps finalize, independent qualification, protected attestation, and every native handoff
+unreachable. Their dormant definitions remain visible for review, but each downstream job has a repository-controlled
+literal-false condition. This revision cannot qualify, attest, tag, upload, or publish a Forge release.
+
+Each native job asks Forge to write its candidate-controlled build-input observation into a fresh private
+`RUNNER_TEMP` namespace. The authority consumes that file as the first operation after a successful synchronous
+`release-build`, validates a strict bounded contract, reduces native values to fixed profiles, counts, and path classes,
+then deletes the raw namespace before running the slower outer-runner probes. The raw JSON and its Base64-encoded native
+values are never uploaded, cached, hashed into evidence, or treated as encryption. The resulting v2 runner observation
+is an untrusted bootstrap diagnostic, not a builder record, provenance byproduct, protected-job input, approval, or
+release evidence.
+
+This cleanup covers ordinary command and validation failures. A force-killed job may bypass shell cleanup, so the
+current boundary also depends on disposal of the single-use GitHub-hosted runner. Candidate code and the sanitizer run
+as the same runner user; candidate code can falsify, race, or tamper with its self-report. Sanitization limits
+disclosure and diagnostic shape, not candidate authority. Before any later release mode is activated, the observed
+stable inputs and signer-builder identity must be frozen or conservatively verified in a separately reviewed v2 policy
+and verifier change.
 
 The stable provenance identities are documented by the
 [Forge qualification build type](docs/build-types/qualify-v1.md) and the

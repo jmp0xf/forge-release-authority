@@ -12,6 +12,9 @@ VERIFY_WORKFLOW = ROOT / ".github" / "workflows" / "verify.yml"
 WRITER_PATH = ROOT / "scripts" / "write_canary_observation.py"
 WORKFLOW_DIRECTORY = ROOT / ".github" / "workflows"
 POLICY_PATH = ROOT / "contracts" / "release-policy.json"
+README_PATH = ROOT / "README.md"
+BUILD_TYPE_PATH = ROOT / "docs" / "build-types" / "qualify-v1.md"
+BUILDER_PATH = ROOT / "docs" / "builders" / "github-actions-protected-v1.md"
 ALLOWED_ACTIONS = {
     "actions/attest": "508db95dd578ae2727ebd6217d5ba78e4fbda05d",
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -301,6 +304,26 @@ class QualifyWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", workflow)
         self.assertEqual(workflow.count("uses: actions/attest@"), 1)
         self.assertIn("uses: actions/attest@", jobs["protected-attest"])
+
+    def test_stage_a_documentation_preserves_the_canary_evidence_boundary(self) -> None:
+        readme = README_PATH.read_text(encoding="utf-8")
+        build_type = BUILD_TYPE_PATH.read_text(encoding="utf-8")
+        builder = BUILDER_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("`mode=canary`", readme)
+        self.assertIn("literal-false condition", readme)
+        self.assertIn("never uploaded, cached, hashed into evidence", readme)
+        self.assertIn("same runner user", readme)
+
+        self.assertIn('"mode":"canary"', build_type)
+        self.assertIn("Stage A cannot create a v1 predicate", build_type)
+        self.assertIn("raw hash are never uploaded", build_type)
+        self.assertIn("separately reviewed v2", build_type)
+
+        self.assertIn("mechanically unreachable in Stage A", builder)
+        self.assertIn("`candidate-controlled-self-report`", builder)
+        self.assertIn("`excluded-from-release-evidence`", builder)
+        self.assertIn("persistent self-hosted runner", builder)
 
     def test_native_matrix_and_embedded_python_match_reviewed_contracts(self) -> None:
         workflow = QUALIFY_WORKFLOW.read_text(encoding="utf-8")

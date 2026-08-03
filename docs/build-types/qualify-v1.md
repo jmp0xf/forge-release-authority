@@ -2,7 +2,8 @@
 
 Identity: `https://github.com/jmp0xf/forge-release-authority/blob/main/docs/build-types/qualify-v1.md`
 
-Status: contract frozen for bootstrap; the executable workflow is installed for an inactive, non-release canary.
+Status: inactive bootstrap contract; the executable workflow is mechanically restricted to a non-release canary, and
+activation requires separately reviewed v2 identities and verifier rules.
 
 This document defines the `buildType` used by the Forge release authority's deterministic
 [SLSA Provenance v1](https://slsa.dev/spec/v1.2/build-provenance) predicate. It defines how one exact Forge source
@@ -11,7 +12,7 @@ claim a SLSA Build level.
 
 ## Invocation
 
-`.github/workflows/qualify.yml` is initiated manually with one external input:
+The dormant v1 build type has one external parameter:
 
 ```json
 {"sourceCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
@@ -19,7 +20,19 @@ claim a SLSA Build level.
 
 `sourceCommit` must be exactly 40 lowercase hexadecimal characters and must equal the protected Forge `main` HEAD
 resolved by the authority at qualification time. No tag, version, target, feature, command, environment, repository,
-path, or free-form build flag is accepted from the caller.
+path, or free-form build flag is part of a v1 invocation.
+
+The current Stage A `.github/workflows/qualify.yml` is not a v1 invocation. Its manual dispatch accepts exactly
+`sourceCommit` plus a required single-choice diagnostic selector:
+
+```json
+{"mode":"canary","sourceCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+```
+
+`mode` has no `qualification` option or default. Preflight rejects any value other than `canary`, native jobs require
+that value, and finalize, independent qualification, and protected attestation each have a repository-controlled
+literal-false condition. Therefore `mode` never enters v1 `externalParameters`: Stage A cannot create a v1 predicate or
+attestation at all.
 
 The successful invocation is restricted to `refs/heads/main` in the authority repository. The verifier derives
 `authorityCommit` from `GITHUB_SHA`, requires `GITHUB_WORKFLOW_SHA` to equal it, and validates the immutable authority
@@ -98,15 +111,21 @@ describe the actual invocation and must not be fabricated or reused.
 `runDetails.byproducts` contains the five target-specific builder records, sorted by name. Each descriptor contains
 only `name` and a SHA-256 digest. They are diagnostic records, not release subjects or external approvals.
 
-While this build type remains inactive, each native workflow job also uploads one target-specific canary runner
-observation. Those temporary artifacts are bootstrap diagnostics outside this v1 build-type schema: they are not
-builder records, `runDetails.byproducts`, subjects, verifier inputs, or protected-attest inputs. A later reviewed
-change must decide which observed stable constraints to freeze or conservatively verify before activation; merely
+While this build type remains inactive, each native workflow job uploads one target-specific v2 canary runner
+observation. Forge's raw build-input self-report stays in a private runner-temporary namespace; the authority validates
+and reduces it to fixed profiles, counts, and path classes, then deletes it before slower runner probes. The raw file,
+its Base64 native values, and its raw hash are never uploaded. The sanitized summary remains candidate-controlled and
+excluded from release evidence.
+
+These temporary artifacts are bootstrap diagnostics outside this v1 build-type schema: they are not builder records,
+`runDetails.byproducts`, subjects, verifier inputs, or protected-attest inputs. A later reviewed v2 change must decide
+which observed stable constraints to freeze or conservatively verify and must reject all v1 canary identities; merely
 uploading the observations does not change this contract or qualify a release.
 
 ## Process
 
-The build type consists of these fail-closed stages:
+If implemented by a future reviewed authority, the dormant build type consists of these fail-closed stages. None after
+native canary observation is reachable in Stage A:
 
 1. Reject any invocation outside the protected authority `main` ref, derive the authority commit from the trusted
    Actions context, and require the caller's Forge commit to equal the protected Forge `main` HEAD. The five native
