@@ -1,6 +1,6 @@
 name: qualify
 
-run-name: Qualify Forge ${{ inputs.sourceCommit }}
+run-name: Canary Forge ${{ inputs.sourceCommit }}
 
 on:
   workflow_dispatch:
@@ -9,6 +9,12 @@ on:
         description: Exact protected Forge main commit
         required: true
         type: string
+      mode:
+        description: Inactive release-authority diagnostic mode
+        required: true
+        type: choice
+        options:
+          - canary
 
 permissions: {}
 
@@ -18,7 +24,7 @@ env:
   RUSTUP_TOOLCHAIN: 1.96.0
 
 concurrency:
-  group: forge-v0.1.0-rc.2-qualification
+  group: forge-v0.1.0-rc.2-canary
   cancel-in-progress: false
 
 jobs:
@@ -44,6 +50,7 @@ jobs:
       - name: Resolve protected commits and source materials
         working-directory: authority
         env:
+          DISPATCH_MODE: ${{ inputs.mode }}
           FORGE_AUTHORITY_GITHUB_TOKEN: ${{ github.token }}
           SOURCE_COMMIT: ${{ inputs.sourceCommit }}
         run: |
@@ -52,6 +59,8 @@ jobs:
 
           from scripts import verify_release as verifier
 
+          if os.environ["DISPATCH_MODE"] != "canary":
+              raise SystemExit("this workflow revision is canary-only")
           policy, _ = verifier.load_policy(verifier.AUTHORITY_POLICY_PATH)
           authority_commit = verifier._authority_commit_from_actions_environment(os.environ)
           materials = verifier._resolve_github_materials(
@@ -68,6 +77,7 @@ jobs:
   native-build:
     name: Native build / ${{ matrix.target }}
     needs: preflight
+    if: ${{ inputs.mode == 'canary' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     permissions:
@@ -80,34 +90,27 @@ jobs:
             target: x86_64-unknown-linux-musl
             binary: forge-0.1.0-rc.2-x86_64-unknown-linux-musl
             sbom: forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json
-            record: builder-record-x86_64-unknown-linux-musl.json
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             binary: forge-0.1.0-rc.2-aarch64-unknown-linux-musl
             sbom: forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json
-            record: builder-record-aarch64-unknown-linux-musl.json
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             binary: forge-0.1.0-rc.2-x86_64-apple-darwin
             sbom: forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json
-            record: builder-record-x86_64-apple-darwin.json
           - runner: macos-15
             target: aarch64-apple-darwin
             binary: forge-0.1.0-rc.2-aarch64-apple-darwin
             sbom: forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json
-            record: builder-record-aarch64-apple-darwin.json
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             binary: forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe
             sbom: forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json
-            record: builder-record-x86_64-pc-windows-msvc.json
     env:
       AUTHORITY_COMMIT: ${{ github.sha }}
       BINARY: ${{ matrix.binary }}
       CARGO_HOME: ${{ github.workspace }}/native-cargo-home
-      HANDOFF_DIR: ${{ github.workspace }}/native-handoff
       OBSERVATION_DIR: ${{ github.workspace }}/canary-observation
-      RECORD: ${{ matrix.record }}
       SBOM: ${{ matrix.sbom }}
       SOURCE_COMMIT: ${{ inputs.sourceCommit }}
       STAGE_DIR: ${{ github.workspace }}/native-stage
@@ -140,7 +143,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for directory in "$CARGO_HOME" "$STAGE_DIR" "$HANDOFF_DIR"; do
+          BUILD_INPUT_DIR="$RUNNER_TEMP/forge-private-build-input"
+          BUILD_TEMP="$RUNNER_TEMP/forge-private-build-temp"
+          for directory in "$CARGO_HOME" "$STAGE_DIR" "$BUILD_INPUT_DIR" "$BUILD_TEMP"; do
             if [[ -e "$directory" ]]; then
               echo "refusing existing native directory: $directory" >&2
               exit 1
@@ -152,7 +157,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($directory in @($env:CARGO_HOME, $env:STAGE_DIR, $env:HANDOFF_DIR)) {
+          $buildInputDirectory = Join-Path $env:RUNNER_TEMP "forge-private-build-input"
+          $buildTemp = Join-Path $env:RUNNER_TEMP "forge-private-build-temp"
+          foreach ($directory in @($env:CARGO_HOME, $env:STAGE_DIR, $buildInputDirectory, $buildTemp)) {
             if (Test-Path -LiteralPath $directory) {
               throw "refusing existing native directory: $directory"
             }
@@ -210,12 +217,14 @@ jobs:
               exit 1
               ;;
           esac
-      - name: Check, test, and stage native assets
+      - name: Check, test, and observe native candidate
         if: runner.os != 'Windows'
         shell: bash
         working-directory: forge
         run: |
           set -euo pipefail
+          BUILD_INPUT_DIR="$RUNNER_TEMP/forge-private-build-input"
+          BUILD_TEMP="$RUNNER_TEMP/forge-private-build-temp"
           [[ -z "$(git status --porcelain=v2 --untracked-files=all --ignore-submodules=none)" ]]
           cargo fmt --all -- --check
           cargo fetch --locked
@@ -223,48 +232,55 @@ jobs:
           cargo clippy --locked --offline --workspace --all-targets --target "$TARGET" -- -D warnings
           cargo test --locked --offline --workspace --target "$TARGET" --no-fail-fast
           cargo build --locked --offline -p xtask
-          target/debug/xtask release-build --target "$TARGET" --output-dir "$STAGE_DIR"
-          chmod +x "$STAGE_DIR/$BINARY"
-          "$STAGE_DIR/$BINARY" version
-          python "$GITHUB_WORKSPACE/authority/scripts/write_builder_record.py" \
-            --policy "$GITHUB_WORKSPACE/authority/contracts/release-policy.json" \
-            --assets "$STAGE_DIR" \
-            --output-dir "$HANDOFF_DIR" \
-            --target "$TARGET" \
-            --source-commit "$SOURCE_COMMIT" \
-            --authority-commit "$AUTHORITY_COMMIT"
-          cp -- "$STAGE_DIR/$BINARY" "$HANDOFF_DIR/$BINARY"
-          cp -- "$STAGE_DIR/$SBOM" "$HANDOFF_DIR/$SBOM"
-          python - <<'PY'
-          import os
-          import stat
-          from pathlib import Path
-
-          directory = Path(os.environ["HANDOFF_DIR"])
-          expected = {
-              os.environ["BINARY"],
-              os.environ["SBOM"],
-              os.environ["RECORD"],
+          CARGO="$(command -v cargo)"
+          [[ "$CARGO" == /* ]]
+          export CARGO
+          export TEMP="$BUILD_TEMP"
+          export TMP="$BUILD_TEMP"
+          export TMPDIR="$BUILD_TEMP"
+          cleanup_private_build_input() {
+            cleanup_command_status=$?
+            trap - EXIT
+            set +e
+            python "$GITHUB_WORKSPACE/authority/scripts/sanitize_build_input_observation.py" \
+              --cleanup-only \
+              --input-dir "$BUILD_INPUT_DIR" \
+              --runner-temp "$RUNNER_TEMP" \
+              --target "$TARGET"
+            cleanup_status=$?
+            if [[ "$cleanup_status" -ne 0 && "$cleanup_command_status" -eq 0 ]]; then
+              cleanup_command_status=$cleanup_status
+            fi
+            exit "$cleanup_command_status"
           }
-          entries = {entry.name: entry for entry in directory.iterdir()}
-          if set(entries) != expected:
-              raise SystemExit(f"native handoff mismatch: {sorted(entries)}")
-          if any(not stat.S_ISREG(entry.lstat().st_mode) for entry in entries.values()):
-              raise SystemExit("native handoff contains a non-regular file")
-          PY
+          trap cleanup_private_build_input EXIT
+          target/debug/xtask release-build \
+            --target "$TARGET" \
+            --output-dir "$STAGE_DIR" \
+            --build-input-observation-dir "$BUILD_INPUT_DIR"
           python "$GITHUB_WORKSPACE/authority/scripts/write_canary_observation.py" \
             --authority-commit "$AUTHORITY_COMMIT" \
             --binary "$STAGE_DIR/$BINARY" \
+            --build-input-observation-dir "$BUILD_INPUT_DIR" \
+            --build-temp "$BUILD_TEMP" \
             --cargo-home "$CARGO_HOME" \
+            --expected-cargo "$CARGO" \
             --output-dir "$OBSERVATION_DIR" \
+            --runner-temp "$RUNNER_TEMP" \
             --source-commit "$SOURCE_COMMIT" \
+            --source-root "$GITHUB_WORKSPACE/forge" \
             --target "$TARGET"
-      - name: Check, test, and stage native assets on Windows
+          trap - EXIT
+          chmod +x "$STAGE_DIR/$BINARY"
+          "$STAGE_DIR/$BINARY" version
+      - name: Check, test, and observe native candidate on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         working-directory: forge
         run: |
           $ErrorActionPreference = "Stop"
+          $env:BUILD_INPUT_DIR = Join-Path $env:RUNNER_TEMP "forge-private-build-input"
+          $env:BUILD_TEMP = Join-Path $env:RUNNER_TEMP "forge-private-build-temp"
           $status = git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($status) { throw "Forge checkout is not clean" }
@@ -280,38 +296,54 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --offline -p xtask
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\target\debug\xtask.exe release-build --target $env:TARGET --output-dir $env:STAGE_DIR
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:CARGO = (Get-Command cargo.exe -CommandType Application -ErrorAction Stop).Source
+          if (-not [System.IO.Path]::IsPathFullyQualified($env:CARGO)) {
+            throw "resolved Cargo path is not absolute"
+          }
+          $env:TEMP = $env:BUILD_TEMP
+          $env:TMP = $env:BUILD_TEMP
+          $releaseStatus = $null
+          $observationStatus = $null
+          $cleanupStatus = 0
+          try {
+            & .\target\debug\xtask.exe release-build `
+              --target $env:TARGET `
+              --output-dir $env:STAGE_DIR `
+              --build-input-observation-dir $env:BUILD_INPUT_DIR
+            $releaseStatus = $LASTEXITCODE
+            if ($releaseStatus -eq 0) {
+              python "$env:GITHUB_WORKSPACE\authority\scripts\write_canary_observation.py" `
+                --authority-commit $env:AUTHORITY_COMMIT `
+                --binary (Join-Path $env:STAGE_DIR $env:BINARY) `
+                --build-input-observation-dir $env:BUILD_INPUT_DIR `
+                --build-temp $env:BUILD_TEMP `
+                --cargo-home $env:CARGO_HOME `
+                --expected-cargo $env:CARGO `
+                --output-dir $env:OBSERVATION_DIR `
+                --runner-temp $env:RUNNER_TEMP `
+                --source-commit $env:SOURCE_COMMIT `
+                --source-root (Join-Path $env:GITHUB_WORKSPACE "forge") `
+                --target $env:TARGET
+              $observationStatus = $LASTEXITCODE
+            }
+          }
+          finally {
+            python "$env:GITHUB_WORKSPACE\authority\scripts\sanitize_build_input_observation.py" `
+              --cleanup-only `
+              --input-dir $env:BUILD_INPUT_DIR `
+              --runner-temp $env:RUNNER_TEMP `
+              --target $env:TARGET
+            $cleanupStatus = $LASTEXITCODE
+          }
+          if ($null -eq $releaseStatus) { throw "release build did not return a status" }
+          if ($releaseStatus -ne 0) { exit $releaseStatus }
+          if ($null -eq $observationStatus) { throw "canary observation did not return a status" }
+          if ($observationStatus -ne 0) { exit $observationStatus }
+          if ($cleanupStatus -ne 0) { exit $cleanupStatus }
           & (Join-Path $env:STAGE_DIR $env:BINARY) version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python "$env:GITHUB_WORKSPACE\authority\scripts\write_builder_record.py" `
-            --policy "$env:GITHUB_WORKSPACE\authority\contracts\release-policy.json" `
-            --assets $env:STAGE_DIR `
-            --output-dir $env:HANDOFF_DIR `
-            --target $env:TARGET `
-            --source-commit $env:SOURCE_COMMIT `
-            --authority-commit $env:AUTHORITY_COMMIT
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Copy-Item -LiteralPath (Join-Path $env:STAGE_DIR $env:BINARY) -Destination $env:HANDOFF_DIR
-          Copy-Item -LiteralPath (Join-Path $env:STAGE_DIR $env:SBOM) -Destination $env:HANDOFF_DIR
-          $expected = @($env:BINARY, $env:SBOM, $env:RECORD) | Sort-Object
-          $entries = @(Get-ChildItem -LiteralPath $env:HANDOFF_DIR)
-          if ($entries.Where({ -not $_.PSIsContainer }).Count -ne 3 -or $entries.Where({ $_.PSIsContainer }).Count -ne 0) {
-            throw "native handoff does not contain exactly three regular files"
-          }
-          $actual = $entries.Name | Sort-Object
-          if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
-            throw "native handoff names do not match the fixed contract"
-          }
-          python "$env:GITHUB_WORKSPACE\authority\scripts\write_canary_observation.py" `
-            --authority-commit $env:AUTHORITY_COMMIT `
-            --binary (Join-Path $env:STAGE_DIR $env:BINARY) `
-            --cargo-home $env:CARGO_HOME `
-            --output-dir $env:OBSERVATION_DIR `
-            --source-commit $env:SOURCE_COMMIT `
-            --target $env:TARGET
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload canary runner observation
+        if: ${{ inputs.mode == 'canary' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: canary-observation-${{ matrix.target }}
@@ -321,23 +353,10 @@ jobs:
           compression-level: 0
           overwrite: false
           include-hidden-files: false
-      - name: Upload fixed native handoff
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-${{ matrix.target }}
-          path: |
-            ${{ env.HANDOFF_DIR }}/${{ matrix.binary }}
-            ${{ env.HANDOFF_DIR }}/${{ matrix.sbom }}
-            ${{ env.HANDOFF_DIR }}/${{ matrix.record }}
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
-          overwrite: false
-          include-hidden-files: false
-
   finalize:
     name: Finalize candidate assets
     needs: native-build
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -514,6 +533,7 @@ jobs:
   independent-qualify:
     name: Independently verify candidate bytes
     needs: finalize
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -579,6 +599,7 @@ jobs:
   protected-attest:
     name: Protected re-verification and attestation
     needs: independent-qualify
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: forge-release

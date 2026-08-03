@@ -99,3 +99,6 @@ jobs:
           tests.test_write_canary_observation.CanaryObservationTests.test_hash_budget_accepts_windows_path_and_descriptor_projections
           tests.test_write_canary_observation.CanaryObservationTests.test_hash_budget_rejects_same_view_metadata_changes
           tests.test_write_canary_observation.CanaryObservationTests.test_cross_view_snapshot_rejects_unknown_or_different_objects
+          tests.test_sanitize_build_input_observation.BuildInputSanitizerTests.test_windows_consume_removes_raw_and_preserves_only_summary
+          tests.test_sanitize_build_input_observation.BuildInputSanitizerTests.test_cleanup_removes_fixed_raw_before_reporting_entry_overflow
+          tests.test_sanitize_build_input_observation.BuildInputSanitizerTests.test_windows_paths_require_drive_absolute_and_do_not_trust_substrings

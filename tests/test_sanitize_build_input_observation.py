@@ -445,6 +445,56 @@ class BuildInputSanitizerTests(unittest.TestCase):
                             )
                     self.assertFalse(raw_directory.exists())
 
+    @unittest.skipUnless(os.name == "nt", "requires native Windows path semantics")
+    def test_windows_consume_removes_raw_and_preserves_only_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            raw_directory = runner_temp / sanitizer.RAW_DIRECTORY_NAME
+            raw_directory.mkdir()
+            cargo = os.fspath(root / "tool" / "cargo.exe")
+            build_temp = runner_temp / "forge-private-build-temp"
+            working_directory = os.fspath(
+                build_temp / "isolated-checkout" / "source"
+            )
+            target_directory = os.fspath(build_temp / "target-build")
+            document, _, environment = _windows_document()
+            document["cargo_command"] = {
+                "program": _windows_native(cargo),
+                "arguments": _arguments(
+                    WINDOWS_TARGET, target_directory, windows=True
+                ),
+                "working_directory": _windows_native(working_directory),
+            }
+            raw_path = raw_directory / (
+                f"{sanitizer.RAW_FILE_PREFIX}{WINDOWS_TARGET}.json"
+            )
+            raw_path.write_text(json.dumps(document), encoding="utf-8")
+
+            summary = sanitizer.consume_build_input_observation(
+                input_directory=raw_directory,
+                target=WINDOWS_TARGET,
+                source_commit=SOURCE_COMMIT,
+                expected_cargo=cargo,
+                source_root=os.fspath(root / "source"),
+                runner_temp=os.fspath(runner_temp),
+                build_temp=os.fspath(build_temp),
+                stage_directory=os.fspath(root / "stage"),
+                cargo_home=os.fspath(root / "cargo-home"),
+                environment=environment,
+            )
+
+            self.assertFalse(raw_directory.exists())
+            self.assertEqual(summary["schema"], sanitizer.SUMMARY_SCHEMA)
+            self.assertEqual(
+                summary["reported_windows_msvc_environment"]["status"],
+                "reported-observed",
+            )
+            rendered = json.dumps(summary, sort_keys=True)
+            self.assertNotIn(os.fspath(root), rendered)
+            self.assertNotIn("raw_base64", rendered)
+
     def test_consume_rejects_oversize_and_symlink_without_retaining_raw(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
